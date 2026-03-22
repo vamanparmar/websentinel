@@ -5,6 +5,7 @@
 [![License](https://img.shields.io/badge/License-MIT-green)](LICENSE)
 [![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey)]()
 [![Bug Bounty](https://img.shields.io/badge/Use%20Case-Bug%20Bounty%20%7C%20Pentest-red)]()
+[![Tests](https://img.shields.io/badge/Tests-92%20passing-brightgreen)]()
 
 > **For authorized security testing only. Unauthorized use is illegal.**
 
@@ -66,7 +67,7 @@ Single file. One dependency (`requests`). 23 scanning modules. 4 report formats.
 ## Installation
 
 ```bash
-git clone https://github.com/yourusername/websentinel.git
+git clone https://github.com/vamanparmar/websentinel.git
 cd websentinel
 pip install requests
 ```
@@ -182,6 +183,45 @@ smuggling, prototype, 2fa, websocket, files, api, ratelimit
 | **Markdown** | Bug bounty write-ups, GitHub submissions |
 
 Every finding includes: CWE ID, CVSS score, evidence snippet, and fix recommendation.
+
+---
+
+## Testing
+
+The project includes a full test suite — **92 tests, zero external dependencies** beyond `requests`.
+
+### Run tests
+```bash
+# No pip install needed
+python tests/test_websentinel.py
+
+# Or with pytest
+pip install pytest
+pytest tests/ -v
+```
+
+### Test coverage — 18 test classes
+
+| Test Class | What's Covered |
+|------------|---------------|
+| `TestFinding` | Dataclass fields, defaults, `to_dict()` |
+| `TestScanResult` | `add()`, `summary()` counts, WAF fields |
+| `TestURLHelpers` | `_same_host`, `_in_scope`, `_inject_get` |
+| `TestFalsePositive` | All 5 baseline comparison scenarios |
+| `TestSeverityFilter` | Filter logic, URL fallback, accumulation |
+| `TestJWTAnalysis` | `alg=none`, HS256, missing `exp`, expired, `kid` injection, privilege claims |
+| `TestWAFDetection` | Cloudflare detected, clean headers, probe block → bypass mode |
+| `TestSecurityHeaders` | Missing HSTS/CSP, `unsafe-inline`, all headers present |
+| `TestRecon` | Server header, X-Powered-By, HTML comments, emails, tech stack |
+| `TestXSSDetection` | GET/POST reflection, no false positive, max_tests limit |
+| `TestSQLiDetection` | Error-based, boolean-blind, clean = no finding |
+| `TestTLSCheck` | HTTP → HIGH finding, HTTPS = no warning |
+| `TestPayloadGenerators` | Non-empty, structure, WAF bypass ordering |
+| `TestCORSCheck` | CRITICAL with credentials, HIGH without, clean origin |
+| `TestSensitiveFiles` | `.env` CRITICAL, `.git` HIGH, 404 = no findings, 403 = LOW |
+| `TestCrawler` | GET params, POST forms, external links ignored, scope respected |
+| `TestCLIParser` | All flags, required target, invalid severity exits |
+| `TestReportGeneration` | JSON/HTML/Markdown output, summary counts, XSS regression |
 
 ---
 
