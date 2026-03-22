@@ -2,27 +2,27 @@
 # -*- coding: utf-8 -*-
 """
 ╔══════════════════════════════════════════════════════════════════════════════╗
-║          WebSentinel — Advanced Web Vulnerability Assessment Tool           ║
-║                        Bug Bounty & Pentest Edition                         ║
+║          WebSentinel — Advanced Web Vulnerability Assessment Tool            ║
+║                        Bug Bounty & Pentest Edition                          ║
 ╠══════════════════════════════════════════════════════════════════════════════╣
 ║  Version  : 3.0.0                                                            ║
 ║  License  : MIT (for authorized testing only)                                ║
 ╠══════════════════════════════════════════════════════════════════════════════╣
 ║  NEW in v3.0:                                                                ║
-║   + POST form discovery & injection (XSS, SQLi, CMDi, Traversal)           ║
+║   + POST form discovery & injection (XSS, SQLi, CMDi, Traversal)             ║
 ║   + WAF detection & automatic bypass payload switching                       ║
 ║   + Subdomain takeover detection                                             ║
 ║   + GraphQL introspection                                                    ║
-║   + HTTP Request Smuggling (CL.TE / TE.CL)                                 ║
+║   + HTTP Request Smuggling (CL.TE / TE.CL)                                   ║
 ║   + Prototype Pollution                                                      ║
-║   + Baseline response fingerprinting (reduces false positives)              ║
+║   + Baseline response fingerprinting (reduces false positives)               ║
 ║   + Progress bar                                                             ║
-║   + Proxy support (--proxy)                                                 ║
-║   + Severity filter (--severity)                                            ║
-║   + Scope filter (--scope)                                                  ║
-║   + 2FA/OTP bypass heuristics                                               ║
-║   + WebSocket endpoint detection                                            ║
-║   + Improved false-positive filtering                                       ║
+║   + Proxy support (--proxy)                                                  ║
+║   + Severity filter (--severity)                                             ║
+║   + Scope filter (--scope)                                                   ║
+║   + 2FA/OTP bypass heuristics                                                ║
+║   + WebSocket endpoint detection                                             ║
+║   + Improved false-positive filtering                                        ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 
 LEGAL DISCLAIMER:
