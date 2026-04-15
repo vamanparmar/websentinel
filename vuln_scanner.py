@@ -35,6 +35,7 @@ test any target. Unauthorized use is illegal and unethical.
 import argparse
 import base64
 import hashlib
+import html
 import json
 import os
 import re
@@ -46,12 +47,12 @@ import urllib.parse
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime
+from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
 try:
     import requests
     from requests.packages.urllib3.exceptions import InsecureRequestWarning
-    requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
 except ImportError:
     print("[FATAL] Install requests: pip install requests")
     sys.exit(1)
@@ -95,7 +96,19 @@ SEV_COLOR = {
     "INFO":     C.BLUE,
 }
 SEV_ICON = {
-    "CRITICAL": "🔴", "HIGH": "🟠", "MEDIUM": "🟡", "LOW": "🔵", "INFO": "⚪"
+    "CRITICAL": "[CRIT]",
+    "HIGH": "[HIGH]",
+    "MEDIUM": "[MED]",
+    "LOW": "[LOW]",
+    "INFO": "[INFO]",
+}
+
+SEVERITY_ORDER = {
+    "INFO": 0,
+    "LOW": 1,
+    "MEDIUM": 2,
+    "HIGH": 3,
+    "CRITICAL": 4,
 }
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -248,7 +261,9 @@ class VulnScanner:
 
         # Build session
         sess = requests.Session()
-        sess.verify = False
+        sess.verify = not getattr(args, "insecure", False)
+        if not sess.verify:
+            requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
         sess.headers.update({
             "User-Agent":      args.user_agent,
             "Accept":          "text/html,application/xhtml+xml,*/*;q=0.8",
@@ -286,23 +301,87 @@ class VulnScanner:
         }
         print(f"{icons.get(level,'  ')} {msg}")
 
+
+    def _min_severity(self) -> str:
+        return (self.args.severity or "INFO").upper()
+
+    def _severity_allowed(self, severity: str) -> bool:
+        return SEVERITY_ORDER.get(severity, -1) >= SEVERITY_ORDER.get(self._min_severity(), 0)
+
+    def _visible_findings(self) -> List[Finding]:
+        return [finding for finding in self.result.findings if self._severity_allowed(finding.severity)]
+
+    def _visible_summary(self) -> Dict[str, int]:
+        out = {sev: 0 for sev in ("CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO")}
+        for finding in self._visible_findings():
+            out[finding.severity] = out.get(finding.severity, 0) + 1
+        return out
+
+    def _workers(self, ceiling: int) -> int:
+        return max(1, min(getattr(self.args, "threads", 1), ceiling))
+
+    @staticmethod
+    def _risk_score(summary: Dict[str, int]) -> int:
+        return (
+            summary["CRITICAL"] * 10
+            + summary["HIGH"] * 7
+            + summary["MEDIUM"] * 4
+            + summary["LOW"] * 1
+        )
+
+    @staticmethod
+    def _html_text(value: str) -> str:
+        return html.escape(value or "", quote=True)
+
+    @staticmethod
+    def _html_block(value: str) -> str:
+        return html.escape(value or "", quote=True).replace("\\n", "<br>")
+
+    @staticmethod
+    def _markdown_text(value: str) -> str:
+        return (
+            (value or "")
+            .replace("\\\\", "\\\\\\\\")
+            .replace("`", "\\`")
+            .replace("|", "\\|")
+            .replace("\\r", "")
+        )
+
+    @staticmethod
+    def _markdown_block(value: str, limit: Optional[int] = None) -> str:
+        text = (value or "").replace("\\r", "")
+        if limit is not None:
+            text = text[:limit]
+        return text.replace("~~~", "~~ ~")
+
+    @staticmethod
+    def _prepare_output_path(path: str) -> Path:
+        out_path = Path(path).expanduser()
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        return out_path
+
+
     def _finding(self, severity: str, category: str, title: str,
                  description: str, evidence: str = "", recommendation: str = "",
                  url: str = "", cwe: str = "", cvss: float = 0.0, method: str = "GET"):
-        # Severity filter
-        order = ["INFO","LOW","MEDIUM","HIGH","CRITICAL"]
-        min_sev = (self.args.severity or "INFO").upper()
-        if order.index(severity) < order.index(min_sev):
-            f = Finding(severity, category, title, description,
-                        evidence, recommendation, url or self.target, cwe, cvss, method)
-            self.result.add(f)
+        finding = Finding(
+            severity,
+            category,
+            title,
+            description,
+            evidence,
+            recommendation,
+            url or self.target,
+            cwe,
+            cvss,
+            method,
+        )
+        self.result.add(finding)
+        if not self._severity_allowed(severity):
             return
 
-        f = Finding(severity, category, title, description,
-                    evidence, recommendation, url or self.target, cwe, cvss, method)
-        self.result.add(f)
         c    = SEV_COLOR.get(severity, C.RESET)
-        icon = SEV_ICON.get(severity, "•")
+        icon = SEV_ICON.get(severity, "*")
         print(f"\n  {icon} {c}[{severity}]{C.RESET} {C.BOLD}{title}{C.RESET}")
         if url and url != self.target:
             print(f"     {C.DIM}URL  ({method}):{C.RESET} {url[:110]}")
@@ -313,8 +392,6 @@ class VulnScanner:
             print(f"     {C.DIM}{cwe}  CVSS {cvss}{C.RESET}")
         if recommendation:
             print(f"     {C.GREEN}Fix:{C.RESET} {recommendation}")
-
-    # ── URL helpers ───────────────────────────────────────────────────────────
 
     def _same_host(self, url: str) -> bool:
         return urllib.parse.urlparse(url).hostname == self.host
@@ -657,7 +734,7 @@ class VulnScanner:
                 return None
 
         prog = Progress(len(self.SUBDOMAINS), "subdomains")
-        with ThreadPoolExecutor(max_workers=30) as ex:
+        with ThreadPoolExecutor(max_workers=self._workers(30)) as ex:
             futures = {ex.submit(resolve, s): s for s in self.SUBDOMAINS}
             for fut in as_completed(futures):
                 prog.update()
@@ -770,7 +847,7 @@ class VulnScanner:
             except Exception:
                 return None
 
-        with ThreadPoolExecutor(max_workers=30) as ex:
+        with ThreadPoolExecutor(max_workers=self._workers(30)) as ex:
             futures = {ex.submit(check, p): p for p in self.PORT_MAP}
             for fut in as_completed(futures):
                 r = fut.result()
@@ -1999,16 +2076,17 @@ class VulnScanner:
                                url, cwe, cvss)
             return None
 
-        with ThreadPoolExecutor(max_workers=20) as ex:
+        with ThreadPoolExecutor(max_workers=self._workers(20)) as ex:
             futures = {ex.submit(probe, p): p for p in self.SENSITIVE_PATHS}
             for fut in as_completed(futures):
                 r = fut.result()
                 if r:
                     self.result.add(r)
-                    c    = SEV_COLOR.get(r.severity, C.RESET)
-                    icon = SEV_ICON.get(r.severity, "•")
-                    print(f"\n  {icon} {c}[{r.severity}]{C.RESET} {C.BOLD}{r.title}{C.RESET}")
-                    print(f"     {C.DIM}URL:{C.RESET} {r.url}")
+                    if self._severity_allowed(r.severity):
+                        c    = SEV_COLOR.get(r.severity, C.RESET)
+                        icon = SEV_ICON.get(r.severity, "*")
+                        print(f"\n  {icon} {c}[{r.severity}]{C.RESET} {C.BOLD}{r.title}{C.RESET}")
+                        print(f"     {C.DIM}URL:{C.RESET} {r.url}")
         prog.done()
 
     # ══════════════════════════════════════════════════════════════════════════
@@ -2102,7 +2180,7 @@ class VulnScanner:
             return results
 
         all_results = []
-        with ThreadPoolExecutor(max_workers=15) as ex:
+        with ThreadPoolExecutor(max_workers=self._workers(15)) as ex:
             futures = {ex.submit(probe, p): p for p in self.API_PATHS}
             for fut in as_completed(futures):
                 r = fut.result()
@@ -2188,30 +2266,33 @@ class VulnScanner:
     # REPORTING
     # ══════════════════════════════════════════════════════════════════════════
 
+
     def _print_report(self):
         self.result.end_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        summary    = self.result.summary()
+        findings   = self._visible_findings()
+        summary    = self._visible_summary()
         total      = sum(summary.values())
-        risk_score = (summary["CRITICAL"]*10 + summary["HIGH"]*7 +
-                      summary["MEDIUM"]*4  + summary["LOW"]*1)
+        risk_score = self._risk_score(summary)
 
-        print(f"\n\n{C.CYAN}{'═'*70}{C.RESET}")
-        print(f"{C.BOLD}{C.CYAN}  WEBSENTINEL v{__version__} — FINAL REPORT{C.RESET}")
-        print(f"{C.CYAN}{'═'*70}{C.RESET}")
+        print(f"\n\n{C.CYAN}{'='*70}{C.RESET}")
+        print(f"{C.BOLD}{C.CYAN}  WEBSENTINEL v{__version__} - FINAL REPORT{C.RESET}")
+        print(f"{C.CYAN}{'='*70}{C.RESET}")
         print(f"  Target      : {C.WHITE}{self.target}{C.RESET}")
-        print(f"  Scanned     : {self.result.start_time} → {self.result.end_time}")
+        print(f"  Scanned     : {self.result.start_time} -> {self.result.end_time}")
+        if self.args.severity:
+            print(f"  Min Sev     : {C.WHITE}{self.args.severity}{C.RESET}")
         if self.result.waf_detected:
             print(f"  WAF         : {C.YELLOW}{self.result.waf_name}{C.RESET}")
         print(f"  Total finds : {C.BOLD}{total}{C.RESET}")
         print(f"  Risk Score  : {C.BOLD}{C.RED if risk_score>50 else C.YELLOW}{risk_score}{C.RESET}")
-        print(f"{C.CYAN}{'─'*70}{C.RESET}")
+        print(f"{C.CYAN}{'-'*70}{C.RESET}")
         for sev in ("CRITICAL","HIGH","MEDIUM","LOW","INFO"):
             c = SEV_COLOR[sev]
             print(f"  {SEV_ICON[sev]} {c}{sev:<10}{C.RESET} {summary[sev]}")
-        print(f"{C.CYAN}{'─'*70}{C.RESET}")
+        print(f"{C.CYAN}{'-'*70}{C.RESET}")
 
         for sev in ("CRITICAL","HIGH","MEDIUM","LOW","INFO"):
-            grp = [f for f in self.result.findings if f.severity == sev]
+            grp = [f for f in findings if f.severity == sev]
             if not grp:
                 continue
             print(f"\n  {SEV_ICON[sev]} {SEV_COLOR[sev]}{sev}  ({len(grp)}){C.RESET}")
@@ -2219,53 +2300,85 @@ class VulnScanner:
                 method_tag = f" [{f.method}]" if f.method != "GET" else ""
                 print(f"    [{f.category}]{method_tag} {C.BOLD}{f.title}{C.RESET}")
                 if f.url and f.url != self.target:
-                    print(f"           {C.DIM}→ {f.url[:80]}{C.RESET}")
+                    print(f"           {C.DIM}-> {f.url[:80]}{C.RESET}")
                 if f.evidence:
-                    print(f"           {C.YELLOW}Ev:{C.RESET} {f.evidence.replace(chr(10),' ')[:100]}")
+                    print(f"           {C.YELLOW}Ev:{C.RESET} {f.evidence.replace(chr(10), ' ')[:100]}")
                 if f.recommendation:
                     print(f"           {C.GREEN}Fix: {f.recommendation[:100]}{C.RESET}")
                 if f.cwe:
                     print(f"           {C.DIM}{f.cwe}  CVSS: {f.cvss}{C.RESET}")
 
-        print(f"\n{C.CYAN}{'═'*70}{C.RESET}\n")
+        if not findings:
+            print(f"\n  {C.DIM}No findings matched the active severity filter.{C.RESET}")
+
+        print(f"\n{C.CYAN}{'='*70}{C.RESET}\n")
 
     def save_json(self, path: str):
-        with open(path, "w", encoding="utf-8") as fh:
-            json.dump(self.result.to_dict(), fh, indent=2, ensure_ascii=False)
-        print(f"{C.GREEN}  ✔ JSON report: {path}{C.RESET}")
+        out_path = self._prepare_output_path(path)
+        findings = self._visible_findings()
+        payload = {
+            "target": self.target,
+            "start_time": self.result.start_time,
+            "end_time": self.result.end_time,
+            "waf_detected": self.result.waf_detected,
+            "waf_name": self.result.waf_name,
+            "minimum_severity": self._min_severity(),
+            "summary": self._visible_summary(),
+            "findings": [finding.to_dict() for finding in findings],
+        }
+        with out_path.open("w", encoding="utf-8") as fh:
+            json.dump(payload, fh, indent=2, ensure_ascii=False)
+        print(f"{C.GREEN}  [OK] JSON report: {out_path}{C.RESET}")
 
     def save_html(self, path: str):
-        summary    = self.result.summary()
-        risk_score = (summary["CRITICAL"]*10 + summary["HIGH"]*7 +
-                      summary["MEDIUM"]*4  + summary["LOW"]*1)
+        findings   = self._visible_findings()
+        summary    = self._visible_summary()
+        risk_score = self._risk_score(summary)
+        out_path   = self._prepare_output_path(path)
         sev_colors = {
             "CRITICAL":"#ef4444","HIGH":"#f97316",
             "MEDIUM":"#eab308","LOW":"#3b82f6","INFO":"#6b7280"
         }
         rows = ""
-        for f in self.result.findings:
-            color = sev_colors.get(f.severity,"#6b7280")
+        for f in findings:
+            color = sev_colors.get(f.severity, "#6b7280")
+            evidence_html = ""
+            if f.evidence:
+                evidence_html = f"<b>Evidence:</b> <code>{self._html_block(f.evidence[:300])}</code><br>"
+            fix_html = ""
+            if f.recommendation:
+                fix_html = f"<b>Fix:</b> {self._html_block(f.recommendation)}"
             rows += f"""
             <tr>
-              <td><span class="badge" style="background:{color}">{f.severity}</span></td>
-              <td>{f.category}</td>
-              <td><span class="method">{f.method}</span> <strong>{f.title}</strong></td>
-              <td class="mono">{(f.url or "")[:60]}</td>
-              <td>{f.cwe}</td>
-              <td>{f.cvss}</td>
+              <td><span class=\"badge\" style=\"background:{color}\">{self._html_text(f.severity)}</span></td>
+              <td>{self._html_text(f.category)}</td>
+              <td><span class=\"method\">{self._html_text(f.method)}</span> <strong>{self._html_text(f.title)}</strong></td>
+              <td class=\"mono\">{self._html_text((f.url or '')[:60])}</td>
+              <td>{self._html_text(f.cwe)}</td>
+              <td>{self._html_text(str(f.cvss))}</td>
             </tr>
-            <tr class="dr">
-              <td colspan="6">
-                <b>Description:</b> {f.description}<br>
-                {'<b>Evidence:</b> <code>'+f.evidence[:300]+'</code><br>' if f.evidence else ''}
-                {'<b>Fix:</b> '+f.recommendation if f.recommendation else ''}
+            <tr class=\"dr\">
+              <td colspan=\"6\">
+                <b>Description:</b> {self._html_block(f.description)}<br>
+                {evidence_html}
+                {fix_html}
               </td>
             </tr>"""
 
-        html = f"""<!DOCTYPE html>
-<html lang="en"><head><meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>WebSentinel {__version__} — {self.target}</title>
+        if not rows:
+            rows = """
+            <tr>
+              <td colspan=\"6\" style=\"text-align:center;color:#94a3b8\">No findings matched the active severity filter.</td>
+            </tr>"""
+
+        filter_meta = ""
+        if self.args.severity:
+            filter_meta = f"&nbsp;|&nbsp; Min Severity: <strong>{self._html_text(self.args.severity)}</strong>"
+
+        html_doc = f"""<!DOCTYPE html>
+<html lang=\"en\"><head><meta charset=\"UTF-8\">
+<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">
+<title>WebSentinel {__version__} - {self._html_text(self.target)}</title>
 <style>
 :root{{--bg:#0f1117;--card:#1a1d27;--bdr:#2d3148;--txt:#e2e8f0;--dim:#64748b}}
 *{{box-sizing:border-box;margin:0;padding:0}}
@@ -2286,83 +2399,86 @@ td{{padding:.6rem 1rem;border-top:1px solid var(--bdr);font-size:.87rem;vertical
 code{{background:#0f1117;padding:.1rem .3rem;border-radius:4px;font-size:.79rem;word-break:break-all}}
 footer{{margin-top:2rem;color:var(--dim);font-size:.8rem;text-align:center}}
 </style></head><body>
-<h1>🛡 WebSentinel Security Report <small style="font-size:1rem;color:var(--dim)">v{__version__}</small></h1>
-<div class="meta">
-  Target: <strong>{self.target}</strong> &nbsp;|&nbsp;
-  {self.result.start_time} → {self.result.end_time} &nbsp;|&nbsp;
+<h1>WebSentinel Security Report <small style=\"font-size:1rem;color:var(--dim)\">v{__version__}</small></h1>
+<div class=\"meta\">
+  Target: <strong>{self._html_text(self.target)}</strong> &nbsp;|&nbsp;
+  {self._html_text(self.result.start_time)} -&gt; {self._html_text(self.result.end_time)} &nbsp;|&nbsp;
   Total: <strong>{sum(summary.values())}</strong> &nbsp;|&nbsp;
-  Risk Score: <strong style="color:#f97316">{risk_score}</strong>
-  {f'&nbsp;|&nbsp; WAF: <strong style="color:#eab308">{self.result.waf_name}</strong>' if self.result.waf_detected else ''}
+  Risk Score: <strong style=\"color:#f97316\">{risk_score}</strong>
+  {filter_meta}
+  {f'&nbsp;|&nbsp; WAF: <strong style="color:#eab308">{self._html_text(self.result.waf_name)}</strong>' if self.result.waf_detected else ''}
 </div>
-<div class="cards">
+<div class=\"cards\">
   {''.join(f'<div class="card"><div class="n" style="color:{sev_colors[s]}">{summary[s]}</div><div class="l">{s}</div></div>' for s in ("CRITICAL","HIGH","MEDIUM","LOW","INFO"))}
 </div>
 <table>
   <thead><tr><th>Severity</th><th>Category</th><th>Title</th><th>URL</th><th>CWE</th><th>CVSS</th></tr></thead>
   <tbody>{rows}</tbody>
 </table>
-<footer>Generated by WebSentinel v{__version__} &nbsp;|&nbsp; For authorized security testing only</footer>
+<footer>Generated by WebSentinel v{__version__} | For authorized security testing only</footer>
 </body></html>"""
 
-        with open(path, "w", encoding="utf-8") as fh:
-            fh.write(html)
-        print(f"{C.GREEN}  ✔ HTML report: {path}{C.RESET}")
+        with out_path.open("w", encoding="utf-8") as fh:
+            fh.write(html_doc)
+        print(f"{C.GREEN}  [OK] HTML report: {out_path}{C.RESET}")
 
     def save_markdown(self, path: str):
-        summary    = self.result.summary()
-        risk_score = (summary["CRITICAL"]*10 + summary["HIGH"]*7 +
-                      summary["MEDIUM"]*4  + summary["LOW"]*1)
-        md = f"""# 🛡 WebSentinel v{__version__} Security Report
+        findings   = self._visible_findings()
+        summary    = self._visible_summary()
+        risk_score = self._risk_score(summary)
+        out_path   = self._prepare_output_path(path)
+        md = f"""# WebSentinel v{__version__} Security Report
 
 | Field | Value |
 |-------|-------|
-| **Target** | `{self.target}` |
-| **Scanned** | {self.result.start_time} → {self.result.end_time} |
-| **WAF** | {self.result.waf_name or "None detected"} |
+| **Target** | `{self._markdown_text(self.target)}` |
+| **Scanned** | {self._markdown_text(self.result.start_time)} -> {self._markdown_text(self.result.end_time)} |
+| **WAF** | {self._markdown_text(self.result.waf_name or 'None detected')} |
 | **Risk Score** | {risk_score} |
+| **Minimum Severity** | {self._markdown_text(self._min_severity())} |
 
 ## Summary
 
 | | Severity | Count |
 |-|----------|------:|
-| 🔴 | Critical | {summary['CRITICAL']} |
-| 🟠 | High | {summary['HIGH']} |
-| 🟡 | Medium | {summary['MEDIUM']} |
-| 🔵 | Low | {summary['LOW']} |
-| ⚪ | Info | {summary['INFO']} |
+| [CRIT] | Critical | {summary['CRITICAL']} |
+| [HIGH] | High | {summary['HIGH']} |
+| [MED] | Medium | {summary['MEDIUM']} |
+| [LOW] | Low | {summary['LOW']} |
+| [INFO] | Info | {summary['INFO']} |
 
 ---
 
 ## Findings
 
 """
+        if not findings:
+            md += "No findings matched the active severity filter.\n\n"
+
         for sev in ("CRITICAL","HIGH","MEDIUM","LOW","INFO"):
-            grp = [f for f in self.result.findings if f.severity == sev]
+            grp = [f for f in findings if f.severity == sev]
             if not grp:
                 continue
             md += f"\n### {SEV_ICON[sev]} {sev} ({len(grp)})\n\n"
             for i, f in enumerate(grp, 1):
-                md += f"#### {i}. {f.title}\n\n"
-                md += f"- **Category:** {f.category}  **Method:** `{f.method}`\n"
+                md += f"#### {i}. {self._markdown_text(f.title)}\n\n"
+                md += f"- **Category:** {self._markdown_text(f.category)}  **Method:** `{self._markdown_text(f.method)}`\n"
                 if f.url:
-                    md += f"- **URL:** `{f.url}`\n"
+                    md += f"- **URL:** `{self._markdown_text(f.url)}`\n"
                 if f.cwe:
-                    md += f"- **CWE:** {f.cwe}  **CVSS:** {f.cvss}\n"
-                md += f"\n{f.description}\n\n"
+                    md += f"- **CWE:** {self._markdown_text(f.cwe)}  **CVSS:** {f.cvss}\n"
+                md += f"\n{self._markdown_block(f.description)}\n\n"
                 if f.evidence:
-                    md += f"```\n{f.evidence[:300]}\n```\n\n"
+                    md += f"~~~\n{self._markdown_block(f.evidence, 300)}\n~~~\n\n"
                 if f.recommendation:
-                    md += f"> **Fix:** {f.recommendation}\n\n"
+                    quoted_fix = self._markdown_block(f.recommendation).replace("\n", "\n> ")
+                    md += f"> **Fix:** {quoted_fix}\n\n"
                 md += "---\n\n"
 
-        md += f"\n*WebSentinel v{__version__} — For authorized security testing only*\n"
-        with open(path, "w", encoding="utf-8") as fh:
+        md += f"\n*WebSentinel v{__version__} | For authorized security testing only*\n"
+        with out_path.open("w", encoding="utf-8") as fh:
             fh.write(md)
-        print(f"{C.GREEN}  ✔ Markdown report: {path}{C.RESET}")
-
-    # ══════════════════════════════════════════════════════════════════════════
-    # ORCHESTRATOR
-    # ══════════════════════════════════════════════════════════════════════════
+        print(f"{C.GREEN}  [OK] Markdown report: {out_path}{C.RESET}")
 
     def run(self):
         print(BANNER)
@@ -2437,10 +2553,11 @@ footer{{margin-top:2rem;color:var(--dim);font-size:.8rem;text-align:center}}
 # CLI
 # ══════════════════════════════════════════════════════════════════════════════
 
+
 def build_parser():
     p = argparse.ArgumentParser(
         prog="vuln_scanner",
-        description=f"WebSentinel v{__version__} — Advanced Web Vulnerability Scanner",
+        description=f"WebSentinel v{__version__} - Advanced Web Vulnerability Scanner",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=f"""
 examples:
@@ -2468,13 +2585,15 @@ version: {__version__}
                    help="Custom request header (repeatable)")
     p.add_argument("--proxy",         metavar="URL",
                    help="HTTP proxy (e.g. http://127.0.0.1:8080 for Burp)")
+    p.add_argument("--insecure",      action="store_true",
+                   help="Allow invalid TLS certificates (disabled by default)")
     p.add_argument("--user-agent",    metavar="UA",
                    default=f"Mozilla/5.0 (WebSentinel/{__version__}; Security Research)",
                    help="Custom User-Agent")
     p.add_argument("--timeout",       type=int, default=10,
                    help="Request timeout in seconds (default: 10)")
     p.add_argument("--threads",       type=int, default=10,
-                   help="Thread pool size (default: 10)")
+                   help="Maximum worker count for threaded checks (default: 10)")
     p.add_argument("--max-urls",      type=int, default=30, dest="max_urls",
                    help="Max URLs to inject into per module (default: 30)")
     p.add_argument("--max-tests",     type=int, default=300, dest="max_tests",
@@ -2499,6 +2618,21 @@ def main():
         print(f"{C.RED}[!] Target must start with https:// or http://{C.RESET}")
         print(f"    Example: python vuln_scanner.py https://example.com")
         sys.exit(1)
+
+    parsed_target = urllib.parse.urlparse(args.target)
+    if not parsed_target.netloc:
+        parser.error("Target URL must include a hostname.")
+
+    for name in ("timeout", "threads", "max_urls", "max_tests"):
+        if getattr(args, name) < 1:
+            parser.error(f"--{name.replace('_', '-')} must be at least 1")
+
+    for header in args.header or []:
+        if ":" not in header:
+            parser.error(f"Invalid --header value '{header}'. Use the format K:V.")
+
+    if args.scope and not args.scope.startswith("/"):
+        args.scope = "/" + args.scope.lstrip("/")
 
     try:
         VulnScanner(args.target, args).run()
