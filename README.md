@@ -1,7 +1,7 @@
 # 🛡 WebSentinel — Advanced Web Vulnerability Scanner
 
 [![Python](https://img.shields.io/badge/Python-3.8%2B-blue?logo=python)](https://www.python.org/)
-[![Version](https://img.shields.io/badge/Version-3.1.0-brightgreen)]()
+[![Version](https://img.shields.io/badge/Version-3.1.1-brightgreen)]()
 [![License](https://img.shields.io/badge/License-MIT-green)](LICENSE)
 [![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey)]()
 [![Bug Bounty](https://img.shields.io/badge/Use%20Case-Bug%20Bounty%20%7C%20Pentest-red)]()
@@ -11,6 +11,20 @@
 
 A professional-grade Python web vulnerability scanner for bug bounty hunters and penetration testers.  
 Single file. One dependency (`requests`). 23 scanning modules. 4 report formats.
+
+---
+
+## What's New in v3.1.1
+
+### Bug Fixes
+
+| Fix | Description |
+|-----|-------------|
+| **`check_sensitive_files` redirects** | Was using `allow_redirects=True` — now `False` so redirects to external hosts are correctly detected |
+| **`save_html` XSS** | `self.target` was not HTML-escaped in the report file — now escaped |
+| **Prototype pollution POST** | Builder silently dropped dot-notation payloads (e.g. `__proto__.test=polluted`) — now handled correctly |
+| **WebSocket URL construction** | Relative paths produced triple-slash URLs (e.g. `wss:///socket`) — now correctly joined with host |
+| **Cookie JWT check** | `_is_jwt()` called on cookies with no value, causing `AttributeError` on `.split(".")` — now guarded with `None` check |
 
 ---
 
