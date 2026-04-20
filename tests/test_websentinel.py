@@ -382,6 +382,34 @@ class TestJWTAnalysis(unittest.TestCase):
         sevs = [f.severity for f in self.s.result.findings]
         assert "INFO" in sevs
 
+    def test_cookie_with_none_value_does_not_raise(self):
+        # v3.1.1 fix: check_cookies called _is_jwt(cookie.value) without first
+        # guarding against None, causing AttributeError on .split(".") for cookies
+        # that have no value set. Verify that None-value cookies are silently skipped.
+        s = _make_scanner()
+        none_cookie  = MagicMock(); none_cookie.name = "session"; none_cookie.value = None
+        valid_cookie = MagicMock(); valid_cookie.name = "other";   valid_cookie.value = "plain"
+        resp = _mock_response(status=200, headers={})
+        resp.cookies = [none_cookie, valid_cookie]
+        s.http.get.return_value = resp
+        # Must not raise AttributeError
+        try:
+            s.check_cookies()
+        except AttributeError:
+            self.fail("check_cookies() raised AttributeError on a cookie with value=None")
+
+    def test_cookie_with_empty_string_value_does_not_raise(self):
+        # Empty string is also falsy — should be skipped like None.
+        s = _make_scanner()
+        empty_cookie = MagicMock(); empty_cookie.name = "tok"; empty_cookie.value = ""
+        resp = _mock_response(status=200, headers={})
+        resp.cookies = [empty_cookie]
+        s.http.get.return_value = resp
+        try:
+            s.check_cookies()
+        except (AttributeError, ValueError):
+            self.fail("check_cookies() raised on a cookie with an empty value")
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 6. WAF Detection
@@ -887,6 +915,53 @@ class TestSensitiveFiles(unittest.TestCase):
         # The 403 finding is LOW — it must be dropped when min severity is MEDIUM
         assert len(s.result.findings) == 0
 
+    def test_external_redirect_is_not_treated_as_exposure(self):
+        # v3.1.1 fix: allow_redirects=False means a 301 to an external host
+        # (e.g. a CDN) is no longer mistakenly flagged as a sensitive-file exposure.
+        s = _make_scanner("https://example.com")
+
+        def fake_get(url, **kw):
+            if "/.env" in url:
+                # Simulate a redirect to an external host
+                r = self._resp(301, "", b"")
+                r.headers = {"Location": "https://cdn.external.com/.env"}
+                return r
+            return self._resp(404, "Not Found", b"")
+
+        s.http.get.side_effect = fake_get
+        s.check_sensitive_files()
+        # External redirect should produce no finding
+        assert len(s.result.findings) == 0
+
+    def test_on_host_redirect_does_not_create_finding(self):
+        # A redirect that stays on the same host (e.g. /env → /env/) should
+        # also be ignored — only real 200 exposures or 403s matter.
+        s = _make_scanner("https://example.com")
+
+        def fake_get(url, **kw):
+            if url.endswith("/.env"):
+                r = self._resp(301, "", b"")
+                r.headers = {"Location": "https://example.com/.env/"}
+                return r
+            return self._resp(404, "Not Found", b"")
+
+        s.http.get.side_effect = fake_get
+        s.check_sensitive_files()
+        assert len(s.result.findings) == 0
+
+    def test_sensitive_files_uses_allow_redirects_false(self):
+        # v3.1.1 fix: verify that http.get is always called with
+        # allow_redirects=False so raw redirects can be inspected.
+        s = _make_scanner()
+        s.http.get.return_value = self._resp(404, "Not Found", b"")
+        s.check_sensitive_files()
+
+        for call in s.http.get.call_args_list:
+            kwargs = call[1]
+            assert kwargs.get("allow_redirects") is False, (
+                "check_sensitive_files must pass allow_redirects=False to http.get"
+            )
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 15. GraphQL Introspection
@@ -956,7 +1031,148 @@ class TestGraphQLIntrospection(unittest.TestCase):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 16. Crawler
+# 16. Prototype Pollution
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestPrototypePollution(unittest.TestCase):
+    def test_dot_notation_payload_reflected_creates_finding(self):
+        # v3.1.1 fix: the POST builder previously silently dropped dot-notation
+        # payloads like __proto__.test=polluted. Verify they now produce a finding
+        # when the server reflects "polluted" in the response.
+        s = _make_scanner()
+        s._param_urls = []
+        s._forms = [(
+            "https://example.com/",
+            FormInfo(action="https://example.com/api/data",
+                     method="POST",
+                     fields={"input": "test"})
+        )]
+
+        def fake_post(url, json_data=None, **kw):
+            # Simulate server reflecting a polluted property
+            if json_data and _is_nested_proto(json_data):
+                return _mock_response(text='{"polluted": true, "result": "polluted"}')
+            return _mock_response(text='{"result": "ok"}')
+
+        def _is_nested_proto(obj, depth=0):
+            """Recursively check if dict contains __proto__ key at any level."""
+            if depth > 5:
+                return False
+            for k, v in obj.items():
+                if "__proto__" in k or "constructor" in k:
+                    return True
+                if isinstance(v, dict) and _is_nested_proto(v, depth + 1):
+                    return True
+            return False
+
+        s.http.post.side_effect = fake_post
+        s.check_prototype_pollution()
+
+        pp = [f for f in s.result.findings if f.category == "ProtoPollution"]
+        assert len(pp) >= 1
+
+    def test_build_pp_json_bracket_notation(self):
+        # Bracket notation __proto__[test]=polluted must produce a nested dict.
+        s = _make_scanner()
+        result = s._build_pp_json("__proto__[test]=polluted")
+        assert result is not None
+        assert isinstance(result, dict)
+        # Should contain __proto__ key with nested value
+        assert "__proto__" in result
+
+    def test_build_pp_json_dot_notation(self):
+        # v3.1.1 fix: dot notation __proto__.test=polluted was silently dropped.
+        # _build_pp_json must now return a valid dict for this form.
+        s = _make_scanner()
+        result = s._build_pp_json("__proto__.test=polluted")
+        assert result is not None, (
+            "_build_pp_json returned None for dot-notation payload — "
+            "this was the v3.1.1 bug"
+        )
+        assert isinstance(result, dict)
+
+    def test_build_pp_json_returns_none_for_invalid_payload(self):
+        # Payloads without '=' cannot be parsed and should return None.
+        s = _make_scanner()
+        assert s._build_pp_json("__proto__") is None
+        assert s._build_pp_json("noequalssign") is None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 17. WebSocket Detection
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestWebSocketDetection(unittest.TestCase):
+    def test_absolute_wss_url_used_as_is(self):
+        # Absolute wss:// URLs must not be modified.
+        s = _make_scanner("https://example.com")
+        s.http.get.return_value = _mock_response(
+            text='var ws = new WebSocket("wss://example.com/socket");'
+        )
+        s.check_websocket()
+        ws = [f for f in s.result.findings if f.category == "WebSocket"]
+        assert len(ws) >= 1
+        assert "wss://example.com/socket" in ws[0].title
+        assert "wss:///socket" not in ws[0].title  # no triple-slash
+
+    def test_relative_path_produces_correct_wss_url(self):
+        # v3.1.1 fix: relative paths like "/socket" were joined as wss:///socket.
+        # Now they must be joined with the host to produce wss://example.com/socket.
+        s = _make_scanner("https://example.com")
+        s.http.get.return_value = _mock_response(
+            text='var sock = new WebSocket("/socket");'
+        )
+        s.check_websocket()
+        ws = [f for f in s.result.findings if f.category == "WebSocket"]
+        assert len(ws) >= 1
+        # Must NOT contain triple-slash
+        for f in ws:
+            assert "wss:///" not in f.title, (
+                f"Triple-slash URL detected in finding title: {f.title}"
+            )
+        # Must contain the correctly formed URL
+        assert any("wss://example.com/socket" in f.title for f in ws)
+
+    def test_no_ws_endpoints_produces_no_finding(self):
+        s = _make_scanner("https://example.com")
+        s.http.get.return_value = _mock_response(
+            text="<html><body>No websockets here</body></html>"
+        )
+        s.check_websocket()
+        ws = [f for f in s.result.findings if f.category == "WebSocket"]
+        assert len(ws) == 0
+
+    def test_http_target_uses_ws_scheme(self):
+        # For plain http:// targets the WS scheme should be ws://, not wss://.
+        s = _make_scanner("http://example.com")
+        s.http.get.return_value = _mock_response(
+            text='var ws = new WebSocket("/live");'
+        )
+        s.check_websocket()
+        ws = [f for f in s.result.findings if f.category == "WebSocket"]
+        assert len(ws) >= 1
+        assert any("ws://example.com/live" in f.title for f in ws)
+
+    def test_protocol_relative_url_gets_correct_scheme(self):
+        # Protocol-relative URLs (//example.com/socket) must pick up the
+        # target's scheme (wss for https targets).
+        s = _make_scanner("https://example.com")
+        s.http.get.return_value = _mock_response(
+            text='var ws = new WebSocket("//example.com/socket");'
+        )
+        s.check_websocket()
+        ws = [f for f in s.result.findings if f.category == "WebSocket"]
+        assert len(ws) >= 1
+        assert any("wss://example.com/socket" in f.title for f in ws)
+
+    def test_unreachable_target_no_crash(self):
+        s = _make_scanner()
+        s.http.get.return_value = None
+        s.check_websocket()  # must not raise
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 18. Crawler
 # ══════════════════════════════════════════════════════════════════════════════
 
 class TestCrawler(unittest.TestCase):
@@ -1045,7 +1261,7 @@ class TestCrawler(unittest.TestCase):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 17. CLI / Argument Parser
+# 19. CLI / Argument Parser
 # ══════════════════════════════════════════════════════════════════════════════
 
 class TestCLIParser(unittest.TestCase):
@@ -1098,7 +1314,7 @@ class TestCLIParser(unittest.TestCase):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 18. Report Generation
+# 20. Report Generation
 # ══════════════════════════════════════════════════════════════════════════════
 
 class TestReportGeneration(unittest.TestCase):
@@ -1160,6 +1376,19 @@ class TestReportGeneration(unittest.TestCase):
         assert "<img src=x onerror=alert(1)>" not in content
         assert "&lt;img" in content
 
+    def test_html_report_target_url_is_escaped(self):
+        # v3.1.1 fix: self.target was not HTML-escaped in save_html, allowing
+        # a crafted target URL to inject script tags into the report file.
+        evil_target = 'https://example.com/<script>alert("xss")</script>'
+        s = _make_scanner(evil_target)
+        s.result.end_time = "2024-01-01 00:01:00"
+        s._finding("INFO", "Recon", "Test", "desc")
+        import tempfile, os; tmp_path = tempfile.mkdtemp(); path = os.path.join(tmp_path, "report.html")
+        s.save_html(path)
+        content = open(path).read()
+        assert '<script>alert("xss")</script>' not in content
+        assert "&lt;script&gt;" in content
+
     def test_json_report_summary_counts(self):
         s = _make_scanner()
         s.result.end_time = "2024-01-01 00:01:00"
@@ -1175,7 +1404,7 @@ class TestReportGeneration(unittest.TestCase):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 19. Progress Bar (smoke test — should not raise)
+# 21. Progress Bar (smoke test — should not raise)
 # ══════════════════════════════════════════════════════════════════════════════
 
 class TestProgress(unittest.TestCase):
