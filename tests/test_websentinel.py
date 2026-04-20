@@ -260,12 +260,17 @@ class TestSeverityFilter(unittest.TestCase):
         s._finding("CRITICAL", "SQLi", "Title", "Desc")
         assert len(s.result.findings) == 1
 
-    def test_finding_still_added_when_below_minimum_severity(self):
-        # The current implementation adds all findings regardless of filter —
-        # the filter only controls console output. This test documents that behaviour.
+    def test_finding_dropped_when_below_minimum_severity(self):
+        # v3.1.0 fix: findings below the minimum severity are now correctly
+        # dropped from results, not silently added.
         s = _make_scanner(severity="HIGH")
         s._finding("LOW", "Recon", "Title", "Desc")
-        assert len(s.result.findings) == 1
+        assert len(s.result.findings) == 0
+
+    def test_finding_dropped_info_when_minimum_is_medium(self):
+        s = _make_scanner(severity="MEDIUM")
+        s._finding("INFO", "Recon", "Title", "Desc")
+        assert len(s.result.findings) == 0
 
     def test_multiple_findings_accumulate(self):
         s = _make_scanner()
@@ -283,6 +288,27 @@ class TestSeverityFilter(unittest.TestCase):
         s = _make_scanner("https://example.com")
         s._finding("INFO", "Recon", "T", "D", url="https://example.com/page")
         assert s.result.findings[0].url == "https://example.com/page"
+
+    def test_deduplication_prevents_identical_findings(self):
+        # v3.1.0 addition: thread-safe dedup means calling _finding() twice
+        # with the same severity/category/title/url only stores one result.
+        s = _make_scanner("https://example.com")
+        s._finding("HIGH", "XSS", "Reflected XSS", "Desc", url="https://example.com/search")
+        s._finding("HIGH", "XSS", "Reflected XSS", "Desc", url="https://example.com/search")
+        assert len(s.result.findings) == 1
+
+    def test_deduplication_allows_different_urls(self):
+        # Same title/category/severity but different URL = distinct finding.
+        s = _make_scanner("https://example.com")
+        s._finding("HIGH", "XSS", "Reflected XSS", "Desc", url="https://example.com/a")
+        s._finding("HIGH", "XSS", "Reflected XSS", "Desc", url="https://example.com/b")
+        assert len(s.result.findings) == 2
+
+    def test_deduplication_allows_different_titles(self):
+        s = _make_scanner("https://example.com")
+        s._finding("HIGH", "XSS", "Title One", "Desc")
+        s._finding("HIGH", "XSS", "Title Two", "Desc")
+        assert len(s.result.findings) == 2
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -302,6 +328,21 @@ class TestJWTAnalysis(unittest.TestCase):
 
     def test_is_jwt_invalid_plain_string(self):
         assert self.s._is_jwt("notajwt") is False
+
+    def test_is_jwt_rejects_version_numbers(self):
+        # v3.1.0 fix: dotted version strings like "3.1.0" were previously
+        # matched as JWTs. They must now be rejected — no valid base64url
+        # header with an 'alg' field can be decoded from a short string like "3".
+        assert self.s._is_jwt("3.1.0") is False
+        assert self.s._is_jwt("1.2.3") is False
+        assert self.s._is_jwt("10.0.0-beta") is False
+
+    def test_is_jwt_requires_alg_field_in_header(self):
+        # A token whose header decodes to JSON without 'alg' is not a JWT.
+        def _b64(d):
+            return base64.urlsafe_b64encode(json.dumps(d).encode()).rstrip(b"=").decode()
+        no_alg_token = f"{_b64({'typ': 'JWT'})}.{_b64({'sub': '1'})}.fakesig"
+        assert self.s._is_jwt(no_alg_token) is False
 
     def test_alg_none_creates_critical_finding(self):
         tok = _make_jwt({"alg": "none", "typ": "JWT"}, {"sub": "1"})
@@ -828,9 +869,94 @@ class TestSensitiveFiles(unittest.TestCase):
         low = [f for f in s.result.findings if f.severity == "LOW"]
         assert len(low) >= 1
 
+    def test_sensitive_files_respects_severity_filter(self):
+        # v3.1.0 fix: check_sensitive_files now routes through _finding() so
+        # the severity filter is honoured — LOW findings are dropped when
+        # minimum severity is set to MEDIUM or above.
+        s = _make_scanner(severity="MEDIUM")
+        body = b"Forbidden"
+
+        def fake_get(url, **kw):
+            # Return 403 for .env (would produce a LOW finding) and 404 for all else
+            if "/.env" in url:
+                return self._resp(403, "Forbidden", body)
+            return self._resp(404, "Not Found", b"")
+
+        s.http.get.side_effect = fake_get
+        s.check_sensitive_files()
+        # The 403 finding is LOW — it must be dropped when min severity is MEDIUM
+        assert len(s.result.findings) == 0
+
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 15. Crawler
+# 15. GraphQL Introspection
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestGraphQLIntrospection(unittest.TestCase):
+    def test_introspection_post_sends_json_not_form_data(self):
+        # v3.1.0 fix: introspection query must be sent as a JSON body, not
+        # form-encoded data. Verify that http.post is called with json_data=
+        # (i.e. the 'json' kwarg reaches requests) and not data= only.
+        s = _make_scanner()
+
+        # First POST (/graphql probe) → looks like a GraphQL endpoint
+        probe_resp = _mock_response(
+            status=200,
+            text='{"data": {"__typename": "Query"}}',
+        )
+        # Second POST (introspection) → returns a schema
+        intro_resp = _mock_response(
+            status=200,
+            text='{"data": {"__schema": {"types": [{"name": "Query", "kind": "OBJECT", "fields": []}]}}}',
+        )
+        intro_resp.json.return_value = {
+            "data": {
+                "__schema": {
+                    "types": [{"name": "Query", "kind": "OBJECT", "fields": []}]
+                }
+            }
+        }
+
+        s.http.post.side_effect = [probe_resp, intro_resp]
+        s.check_graphql()
+
+        # Collect all calls to http.post
+        calls = s.http.post.call_args_list
+        assert len(calls) >= 2, "Expected at least two POST calls (probe + introspection)"
+
+        # The introspection call (second call) must pass json_data, not raw data
+        introspection_call = calls[1]
+        kwargs = introspection_call[1]  # keyword arguments
+        # json_data kwarg must be present and be a dict (not a raw string)
+        assert "json_data" in kwargs, (
+            "Introspection POST must use json_data= (sends Content-Type: application/json), "
+            "not data= (sends form-encoded body)"
+        )
+        assert isinstance(kwargs["json_data"], dict), (
+            "json_data must be a dict, not a raw JSON string"
+        )
+
+    def test_graphql_endpoint_not_found_produces_no_finding(self):
+        s = _make_scanner()
+        # All probes return 404
+        s.http.post.return_value = _mock_response(status=404, text="Not Found")
+        s.check_graphql()
+        graphql = [f for f in s.result.findings if f.category == "GraphQL"]
+        assert len(graphql) == 0
+
+    def test_graphql_introspection_disabled_creates_info_finding(self):
+        s = _make_scanner()
+        # Probe succeeds but introspection is blocked
+        probe_resp = _mock_response(status=200, text='{"data": {"__typename": "Query"}}')
+        blocked    = _mock_response(status=200, text='{"errors": [{"message": "introspection disabled"}]}')
+        s.http.post.side_effect = [probe_resp, blocked]
+        s.check_graphql()
+        graphql = [f for f in s.result.findings if f.category == "GraphQL"]
+        assert any(f.severity == "INFO" for f in graphql)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 16. Crawler
 # ══════════════════════════════════════════════════════════════════════════════
 
 class TestCrawler(unittest.TestCase):
@@ -919,7 +1045,7 @@ class TestCrawler(unittest.TestCase):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 16. CLI / Argument Parser
+# 17. CLI / Argument Parser
 # ══════════════════════════════════════════════════════════════════════════════
 
 class TestCLIParser(unittest.TestCase):
@@ -972,7 +1098,7 @@ class TestCLIParser(unittest.TestCase):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 17. Report Generation (HTML escaping regression)
+# 18. Report Generation
 # ══════════════════════════════════════════════════════════════════════════════
 
 class TestReportGeneration(unittest.TestCase):
@@ -1010,30 +1136,36 @@ class TestReportGeneration(unittest.TestCase):
         assert "WebSentinel"     in content
         assert "HIGH"            in content
 
-    def test_html_report_xss_in_evidence_does_not_execute(self):
-        """
-        Regression: evidence containing HTML should not introduce executable
-        script tags into the report.  When html.escape() is applied this test
-        passes; when it is missing the raw tag leaks through.
-        NOTE: This test documents the CURRENT behaviour.  If you add escaping,
-        the assertion flips to `assert '<script>' not in content`.
-        """
+    def test_html_report_xss_in_evidence_is_escaped(self):
+        # v3.1.0 fix: all finding fields are now HTML-escaped before being
+        # written into the report, so attacker payloads cannot execute.
         evil = '</code><script>alert("pwned")</script><code>'
         s    = self._make_scanner_with_finding(evidence=evil)
         s.result.end_time = "2024-01-01 00:01:00"
         import tempfile, os; tmp_path = tempfile.mkdtemp(); path = os.path.join(tmp_path, "report.html")
         s.save_html(path)
         content = open(path).read()
-        # Document current (unsafe) state — flip this assertion after adding html.escape()
-        # assert '&lt;script&gt;' in content   # what it SHOULD look like
-        assert "<script>alert" in content or "&lt;script&gt;" in content  # either is noted
+        # The raw <script> tag must NOT appear — only the escaped form is acceptable
+        assert "<script>alert" not in content
+        assert "&lt;script&gt;" in content
+
+    def test_html_report_title_field_is_escaped(self):
+        # Titles can also carry injection — verify they are escaped too.
+        s = _make_scanner()
+        s.result.end_time = "2024-01-01 00:01:00"
+        s._finding("HIGH", "XSS", '<img src=x onerror=alert(1)>', "desc")
+        import tempfile, os; tmp_path = tempfile.mkdtemp(); path = os.path.join(tmp_path, "report.html")
+        s.save_html(path)
+        content = open(path).read()
+        assert "<img src=x onerror=alert(1)>" not in content
+        assert "&lt;img" in content
 
     def test_json_report_summary_counts(self):
         s = _make_scanner()
         s.result.end_time = "2024-01-01 00:01:00"
-        s._finding("CRITICAL", "SQLi", "T", "D")
-        s._finding("CRITICAL", "SQLi", "T2","D")
-        s._finding("HIGH",     "XSS",  "T3","D")
+        s._finding("CRITICAL", "SQLi", "T",  "D")
+        s._finding("CRITICAL", "SQLi", "T2", "D")
+        s._finding("HIGH",     "XSS",  "T3", "D")
         import tempfile, os; tmp_path = tempfile.mkdtemp(); path = os.path.join(tmp_path, "report.json")
         s.save_json(path)
         data = json.load(open(path))
@@ -1043,7 +1175,7 @@ class TestReportGeneration(unittest.TestCase):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# 18. Progress Bar (smoke test — should not raise)
+# 19. Progress Bar (smoke test — should not raise)
 # ══════════════════════════════════════════════════════════════════════════════
 
 class TestProgress(unittest.TestCase):
