@@ -1,7 +1,7 @@
 # 🛡 WebSentinel — Advanced Web Vulnerability Scanner
 
 [![Python](https://img.shields.io/badge/Python-3.8%2B-blue?logo=python)](https://www.python.org/)
-[![Version](https://img.shields.io/badge/Version-3.0.0-brightgreen)]()
+[![Version](https://img.shields.io/badge/Version-3.1.0-brightgreen)]()
 [![License](https://img.shields.io/badge/License-MIT-green)](LICENSE)
 [![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey)]()
 [![Bug Bounty](https://img.shields.io/badge/Use%20Case-Bug%20Bounty%20%7C%20Pentest-red)]()
@@ -11,6 +11,31 @@
 
 A professional-grade Python web vulnerability scanner for bug bounty hunters and penetration testers.  
 Single file. One dependency (`requests`). 23 scanning modules. 4 report formats.
+
+---
+
+## What's New in v3.1.0
+
+### Bug Fixes
+
+| Fix | Description |
+|-----|-------------|
+| **Severity filter** | Was silently adding suppressed findings to results — now correctly dropped |
+| **GraphQL introspection** | Was sending the query as form-data instead of a JSON body |
+| **HTML report XSS** | Report embedded raw attacker payloads — all finding fields are now HTML-escaped |
+| **TLS expiry finding** | Missing required `description` argument — fixed |
+| **TLS SAN check finding** | Missing required `description` argument — fixed |
+| **JWT detection** | Was matching any dotted string (e.g. version numbers) — now validates base64url structure and `alg` field |
+| **`check_sensitive_files`** | Was calling `self.result.add()` directly, bypassing severity filter and dedup — now routes through `_finding()` |
+| **`datetime.utcnow()`** | Deprecated call replaced with timezone-aware `datetime.now(timezone.utc)` |
+| **CMDi elapsed time** | Was computed twice — captured once for consistency |
+
+### Additions
+
+| Addition | Description |
+|----------|-------------|
+| **Thread-safe deduplication** | Prevents duplicate findings when multiple threads hit the same endpoint |
+| **`subprocess` import** | Hoisted to module level for cleaner imports |
 
 ---
 
@@ -46,20 +71,20 @@ Single file. One dependency (`requests`). 23 scanning modules. 4 report formats.
 | 05 | TLS / SSL | Protocol, cipher strength, cert expiry, SAN validation |
 | 06 | Security Headers | HSTS, CSP, X-Frame-Options, Referrer-Policy, Permissions-Policy |
 | 07 | Cookies + JWT | Flags, entropy, alg=none, kid injection, missing exp |
-| 08 | CORS | 5 origin bypass patterns, credentials reflection |
+| 08 | CORS | 6 origin bypass patterns × GET + OPTIONS preflight |
 | 09 | XSS (GET + POST) | 14 payloads + WAF bypass variants across all params and forms |
 | 10 | SQL Injection (GET + POST) | Error-based, boolean-blind, time-based (MySQL/MSSQL/PG/SQLite) |
 | 11 | Command Injection (GET + POST) | Output-based + time-based, Linux and Windows |
 | 12 | Path Traversal (GET + POST) | 9 encoded variants, cross-platform |
-| 13 | SSRF | AWS/GCP/Azure/DO metadata, localhost, file:// |
+| 13 | SSRF | AWS/GCP/Azure metadata, localhost, IPv6, file:// |
 | 14 | Open Redirect | 8 bypass variants |
 | 15 | GraphQL | Endpoint discovery, introspection, schema dump |
 | 16 | HTTP Request Smuggling | CL.TE and TE.CL timing detection |
 | 17 | Prototype Pollution | Query string and JSON body injection |
 | 18 | 2FA/OTP Bypass | Empty OTP + rate limit check |
 | 19 | WebSocket Detection | Finds WS endpoints, flags for manual testing |
-| 20 | Sensitive Files | 55+ paths: .env, .git, SSH keys, logs, admin panels |
-| 21 | API Fuzzing | 30+ endpoints, unauthenticated access |
+| 20 | Sensitive Files | 57+ paths: .env, .git, SSH keys, logs, admin panels |
+| 21 | API Fuzzing | 30+ endpoints, GET/POST/OPTIONS, unauthenticated access |
 | 22 | Rate Limiting | 30-request burst test |
 
 ---
@@ -179,7 +204,7 @@ smuggling, prototype, 2fa, websocket, files, api, ratelimit
 |--------|---------|
 | **Console** | Real-time colored output |
 | **JSON** | Tool integration, automation pipelines |
-| **HTML** | Dark-theme visual report for clients/teams |
+| **HTML** | Dark-theme visual report for clients/teams (XSS-safe — all fields escaped) |
 | **Markdown** | Bug bounty write-ups, GitHub submissions |
 
 Every finding includes: CWE ID, CVSS score, evidence snippet, and fix recommendation.
