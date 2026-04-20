@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
@@ -6,7 +5,7 @@
 ║          WebSentinel — Advanced Web Vulnerability Assessment Tool            ║
 ║                        Bug Bounty & Pentest Edition                          ║
 ╠══════════════════════════════════════════════════════════════════════════════╣
-║  Version  : 3.1.0                                                            ║
+║  Version  : 3.1.1                                                            ║
 ║  License  : MIT (for authorized testing only)                                ║
 ╠══════════════════════════════════════════════════════════════════════════════╣
 ║  NEW in v3.0:                                                                ║
@@ -37,6 +36,17 @@
 ║   ✔ BUG: CMDi elapsed time computed twice — captured once for consistency    ║
 ║   ✔ ADD: Thread-safe deduplication prevents duplicate findings from threads  ║
 ║   ✔ ADD: subprocess import hoisted to module level                           ║
+╠══════════════════════════════════════════════════════════════════════════════╣
+║  FIXED in v3.1.1:                                                            ║
+║   ✔ BUG: check_sensitive_files used allow_redirects=True — now False so      ║
+║          redirects to external hosts are correctly detected                  ║
+║   ✔ BUG: save_html did not HTML-escape self.target — XSS in report file      ║
+║   ✔ BUG: check_prototype_pollution POST builder silently dropped dot-        ║
+║          notation payloads (e.g. __proto__.test=polluted) — now handled      ║
+║   ✔ BUG: check_websocket produced triple-slash URLs for relative paths       ║
+║          (e.g. wss:///socket) — now correctly joined with host               ║
+║   ✔ BUG: check_cookies called _is_jwt(cookie.value) without None guard —     ║
+║          cookies with no value raised AttributeError on .split(".")          ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 
 LEGAL DISCLAIMER:
@@ -73,7 +83,7 @@ except ImportError:
     print("[FATAL] Install requests: pip install requests")
     sys.exit(1)
 
-__version__ = "3.1.0"
+__version__ = "3.1.1"
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Terminal Colors
@@ -313,7 +323,7 @@ class VulnScanner:
         order = ["INFO","LOW","MEDIUM","HIGH","CRITICAL"]
         min_sev = (self.args.severity or "INFO").upper()
         if order.index(severity) < order.index(min_sev):
-            return   # BUG FIX: was incorrectly adding suppressed findings to results
+            return   # suppressed findings are NOT added to results
 
         # Thread-safe deduplication: skip if we've already reported this exact finding
         dedup_key = f"{severity}::{category}::{title}::{url or self.target}"
@@ -715,7 +725,6 @@ class VulnScanner:
 
     def _check_subdomain_takeover(self, fqdn: str):
         """Check if a subdomain is vulnerable to takeover."""
-        # Check CNAME
         try:
             result = subprocess.run(
                 ["nslookup", "-type=CNAME", fqdn],
@@ -725,9 +734,9 @@ class VulnScanner:
             for sig, service in self.TAKEOVER_SIGNATURES.items():
                 if sig in cname_output:
                     # Confirm by fetching the page
-                    resp = self.http.get(f"https://{fqdn}", timeout=5)
+                    resp = self.http.get(f"https://{fqdn}")
                     if resp is None:
-                        resp = self.http.get(f"http://{fqdn}", timeout=5)
+                        resp = self.http.get(f"http://{fqdn}")
                     if resp:
                         body_l = resp.text.lower()
                         if any(err in body_l for err in self.TAKEOVER_ERROR_PAGES):
@@ -863,13 +872,16 @@ class VulnScanner:
 
             not_after = cert.get("notAfter","")
             if not_after:
-                exp  = datetime.strptime(not_after, "%b %d %H:%M:%S %Y %Z")
-                days = (exp - datetime.now(timezone.utc).replace(tzinfo=None)).days
+                # FIX: attach UTC tzinfo after parsing (strptime drops it for %Z="GMT")
+                # then compare two tz-aware datetimes — no TypeError, no deprecation
+                exp  = datetime.strptime(not_after, "%b %d %H:%M:%S %Y %Z") \
+                               .replace(tzinfo=timezone.utc)
+                days = (exp - datetime.now(timezone.utc)).days
                 if days < 0:
                     self._finding("CRITICAL","TLS","Certificate EXPIRED",
-                                  f"Expired {-days} day(s) ago.",
+                                  f"Certificate expired {-days} day(s) ago.",
                                   f"Expiry: {not_after}",
-                                  "Renew immediately.",
+                                  "Renew the TLS certificate immediately.",
                                   cwe="CWE-298", cvss=9.1)
                 elif days < 14:
                     self._finding("CRITICAL","TLS",f"Certificate expires in {days} days",
@@ -984,7 +996,8 @@ class VulnScanner:
             else:
                 self._log(f"Cookie '{cookie.name}': flags OK", "OK")
 
-            if self._is_jwt(cookie.value):
+            # FIX: guard against None cookie value before calling _is_jwt
+            if cookie.value and self._is_jwt(cookie.value):
                 self._analyze_jwt(cookie.value, f"Cookie '{cookie.name}'")
 
     def _is_jwt(self, v: str) -> bool:
@@ -1078,7 +1091,6 @@ class VulnScanner:
 
         found_issues = 0
 
-        # Test both GET requests and OPTIONS preflight (real-world CORS uses OPTIONS)
         for origin, desc in origins:
             for method, resp in [
                 ("GET",     self.http.get(self.target,
@@ -1098,12 +1110,9 @@ class VulnScanner:
                 acam = resp.headers.get("Access-Control-Allow-Methods", "").strip()
                 acah = resp.headers.get("Access-Control-Allow-Headers", "").strip()
 
-                # Check 1: origin directly reflected
                 origin_reflected = (acao == origin)
-                # Check 2: wildcard (only dangerous with credentials)
-                wildcard = (acao == "*")
-                # Check 3: null origin accepted
-                null_accepted = (origin == "null" and acao == "null")
+                wildcard         = (acao == "*")
+                null_accepted    = (origin == "null" and acao == "null")
 
                 if origin_reflected or null_accepted:
                     creds_exposed = acac.lower() == "true"
@@ -1125,10 +1134,9 @@ class VulnScanner:
                         cwe="CWE-942", cvss=cvss
                     )
                     found_issues += 1
-                    break  # one finding per origin is enough
+                    break
 
                 elif wildcard and acac.lower() == "true":
-                    # Wildcard + credentials is invalid per spec but some servers do it
                     self._finding(
                         "CRITICAL", "CORS",
                         f"CORS wildcard + credentials [{method}]",
@@ -1141,7 +1149,6 @@ class VulnScanner:
                     found_issues += 1
                     break
 
-        # Report clearly even when nothing found
         if found_issues == 0:
             self._log(
                 f"Tested {len(origins)} origins × GET+OPTIONS — "
@@ -1659,7 +1666,7 @@ class VulnScanner:
 
     GRAPHQL_ENDPOINTS = ["/graphql","/graphiql","/api/graphql","/gql","/_graphql","/__graphql"]
 
-    INTROSPECTION_QUERY = json.dumps({
+    INTROSPECTION_QUERY = {
         "query": """
         {
           __schema {
@@ -1673,7 +1680,7 @@ class VulnScanner:
           }
         }
         """
-    })
+    }
 
     def check_graphql(self):
         self._section("15 · GraphQL Introspection")
@@ -1691,10 +1698,9 @@ class VulnScanner:
             if "data" in resp.text or "__typename" in resp.text:
                 self._log(f"GraphQL endpoint found: {path}", "WARN")
 
-                # Try introspection
                 intro = self.http.post(
                     url,
-                    json_data=json.loads(self.INTROSPECTION_QUERY),  # BUG FIX: was sending raw string via data=, not json_data=
+                    json_data=self.INTROSPECTION_QUERY,
                     headers={"Content-Type": "application/json"}
                 )
                 if intro and "__schema" in intro.text:
@@ -1731,22 +1737,18 @@ class VulnScanner:
     def check_request_smuggling(self):
         self._section("16 · HTTP Request Smuggling (CL.TE / TE.CL)")
 
-        # We use a timing-based detection heuristic
-        # CL.TE: Send CL=6, body has chunked encoding
-        # If the server hangs for > timeout, it may be buffering the smuggled request
-
         smuggle_headers_clte = {
             "Content-Length":  "6",
             "Transfer-Encoding": "chunked",
             "Connection":      "keep-alive",
         }
-        smuggle_body_clte = "0\r\n\r\nG"   # G starts a smuggled GET
+        smuggle_body_clte = "0\r\n\r\nG"
 
         smuggle_headers_tecl = {
             "Content-Length":  "3",
             "Transfer-Encoding": "chunked",
             "Connection":      "keep-alive",
-            "Transfer-Encoding ": "x",  # Space obfuscation for TE.CL
+            "Transfer-Encoding ": "x",
         }
         smuggle_body_tecl = "1\r\nG\r\n0\r\n\r\n"
 
@@ -1802,7 +1804,6 @@ class VulnScanner:
         for url, params in self._param_urls[:self.args.max_urls]:
             parsed = urllib.parse.urlparse(url)
             for payload in self.PP_PAYLOADS:
-                # Inject into query string directly
                 sep      = "&" if parsed.query else "?"
                 test_url = url + sep + payload
                 resp     = self.http.get(test_url)
@@ -1820,22 +1821,13 @@ class VulnScanner:
                             url=test_url, cwe="CWE-1321", cvss=7.3)
                         break
 
-        # Test in POST body (JSON)
+        # FIX: properly build the nested JSON object for ALL payload notations
         for _, form in self._forms[:10]:
             for payload in self.PP_PAYLOADS:
                 try:
-                    key_parts = payload.split("=")
-                    if "[" in key_parts[0]:
-                        # nested
-                        parts   = re.findall(r'\[([^\]]+)\]', key_parts[0])
-                        obj     = {}
-                        cur     = obj
-                        for i, part in enumerate(parts[:-1]):
-                            cur[part] = {}
-                            cur       = cur[part]
-                        cur[parts[-1]] = "polluted"
-                    else:
-                        obj = {}
+                    obj = self._build_pp_json(payload)
+                    if obj is None:
+                        continue
                     resp = self.http.post(
                         form.action,
                         json_data=obj,
@@ -1855,6 +1847,36 @@ class VulnScanner:
 
         self._log(f"Prototype Pollution: {count} tests, {len(found)} issue(s)", "OK")
 
+    def _build_pp_json(self, payload: str) -> Optional[dict]:
+        """
+        Convert a prototype-pollution payload string into a nested JSON dict.
+
+        Handles both bracket notation  (__proto__[test]=polluted)
+        and dot notation               (__proto__.test=polluted).
+        Returns None if the payload cannot be parsed.
+        """
+        if "=" not in payload:
+            return None
+        lhs, _, value = payload.partition("=")
+
+        # Normalise to dot notation then split
+        # e.g. "__proto__[test]" → "__proto__.test"
+        lhs_dot = re.sub(r'\[([^\]]+)\]', r'.\1', lhs)
+        keys    = lhs_dot.split(".")
+
+        # Build nested dict from the key path
+        obj: dict = {}
+        cur: dict = obj
+        for i, key in enumerate(keys):
+            if not key:          # skip empty segments
+                continue
+            if i == len(keys) - 1:
+                cur[key] = value
+            else:
+                cur[key] = {}
+                cur = cur[key]
+        return obj
+
     # ══════════════════════════════════════════════════════════════════════════
     # MODULE 18 — 2FA / OTP BYPASS HEURISTICS
     # ══════════════════════════════════════════════════════════════════════════
@@ -1864,7 +1886,6 @@ class VulnScanner:
         found_forms = []
 
         for _, form in self._forms:
-            # Look for OTP/2FA forms
             otp_fields = [f for f in form.fields
                           if re.search(r"otp|2fa|mfa|code|pin|token|verify",
                                        f, re.I)]
@@ -1894,7 +1915,6 @@ class VulnScanner:
                             url=form.action, cwe="CWE-287", cvss=8.1, method="POST")
 
                 # Test 2: OTP brute-force (try a few)
-                # We only try 5 to be non-intrusive
                 for code in ["000000","111111","123456","000001","999999"]:
                     data = {**form.fields, field: code}
                     r    = self.http.post(form.action, data=data)
@@ -1919,12 +1939,10 @@ class VulnScanner:
         if resp is None:
             return
 
-        # Find WS URLs in source
         ws_patterns = re.findall(
             r'(?:new\s+WebSocket\s*\(\s*["\']|ws://|wss://)([^"\')\s]+)',
             resp.text, re.I
         )
-        # Also find in scripts
         script_srcs = re.findall(r'<script[^>]+src=["\']([^"\']+)["\']', resp.text, re.I)
         for src in script_srcs[:5]:
             abs_src  = urllib.parse.urljoin(self.target, src)
@@ -1942,9 +1960,20 @@ class VulnScanner:
             return
 
         for ws_url in set(ws_patterns[:5]):
-            # Normalize
-            if not ws_url.startswith("ws"):
-                ws_url = ("wss" if self.scheme=="https" else "ws") + "://" + self.host + ws_url
+            # FIX: correctly normalise relative paths — avoid triple-slash URLs
+            if ws_url.startswith("ws://") or ws_url.startswith("wss://"):
+                # Already absolute — use as-is
+                pass
+            elif ws_url.startswith("//"):
+                # Protocol-relative
+                proto = "wss" if self.scheme == "https" else "ws"
+                ws_url = proto + ":" + ws_url
+            else:
+                # Relative path  e.g. "/socket" or "socket"
+                proto  = "wss" if self.scheme == "https" else "ws"
+                path   = ws_url if ws_url.startswith("/") else "/" + ws_url
+                ws_url = f"{proto}://{self.host}{path}"
+
             self._finding("INFO","WebSocket",
                 f"WebSocket endpoint found: {ws_url}",
                 "WebSocket connections should be tested for: missing auth, "
@@ -2024,12 +2053,15 @@ class VulnScanner:
             path, sev, title, cwe, cvss = entry
             prog.update()
             url  = self.target + path
-            resp = self.http.get(url)
+            # FIX: use allow_redirects=False so we can inspect the raw redirect
+            # and correctly reject redirects that point off-host
+            resp = self.http.get(url, allow_redirects=False)
             if resp is None or resp.status_code == 404:
                 return None
-            if resp.status_code in (301,302,307,308):
-                loc = resp.headers.get("Location","")
-                if self.host not in loc:
+            if resp.status_code in (301, 302, 307, 308):
+                loc = resp.headers.get("Location", "")
+                # Ignore on-host redirects (e.g. /admin → /admin/)
+                if self.host not in urllib.parse.urlparse(loc).netloc:
                     return None
             if resp.status_code == 403:
                 return Finding("LOW","Exposure",f"403 Forbidden: {path}",
@@ -2048,8 +2080,7 @@ class VulnScanner:
             for fut in as_completed(futures):
                 r = fut.result()
                 if r:
-                    # BUG FIX: was calling self.result.add(r) directly, bypassing
-                    # severity filter and duplicate checking in _finding()
+                    # Route through _finding() to apply severity filter + dedup
                     self._finding(
                         r.severity, r.category, r.title, r.description,
                         r.evidence, r.recommendation, r.url, r.cwe, r.cvss
@@ -2078,11 +2109,8 @@ class VulnScanner:
     def fuzz_api(self):
         self._section("21 · API Endpoint Fuzzing")
 
-        # Ensure base URL has no trailing slash so paths join cleanly
         base = self.target.rstrip("/")
 
-        # Also try HTTP methods HEAD and OPTIONS for each path
-        # to catch endpoints that block GET but allow other methods
         found_200  = []
         found_auth = []
         found_other= []
@@ -2091,7 +2119,6 @@ class VulnScanner:
 
         def probe(path: str):
             prog.update()
-            # Build clean URL — avoid double-slashes
             url = base + path
             results = []
 
@@ -2111,24 +2138,20 @@ class VulnScanner:
 
                     ct = resp.headers.get("Content-Type", "")
 
-                    # Skip obvious redirects to login page / home
                     if resp.status_code in (301, 302, 307, 308):
                         loc = resp.headers.get("Location", "")
-                        # If redirected to same path with trailing slash, ignore
                         if loc.rstrip("/") == url.rstrip("/"):
                             continue
 
                     if resp.status_code in (200, 201, 204):
-                        # Extra filter: ignore if it's clearly the homepage
-                        # (same size as root page baseline)
                         root_baseline = self._baselines.get(self.target)
                         if root_baseline:
                             _, root_len = root_baseline
                             if abs(len(resp.content) - root_len) < 50:
-                                continue  # Same as homepage, skip
+                                continue
                         results.append((url, method, resp.status_code,
                                         len(resp.content), ct))
-                        break  # One success per path is enough
+                        break
 
                     elif resp.status_code in (401, 403):
                         results.append((url, method, resp.status_code,
@@ -2136,7 +2159,6 @@ class VulnScanner:
                         break
 
                     elif resp.status_code == 405:
-                        # Method not allowed — endpoint exists but rejects this method
                         results.append((url, method, resp.status_code,
                                         len(resp.content), ct))
                         break
@@ -2155,7 +2177,6 @@ class VulnScanner:
                     all_results.extend(r)
         prog.done()
 
-        # De-duplicate by URL
         seen_urls = set()
         for url, method, status, size, ct in all_results:
             if url in seen_urls:
@@ -2290,8 +2311,6 @@ class VulnScanner:
         rows = ""
         for f in self.result.findings:
             color = sev_colors.get(f.severity,"#6b7280")
-            # BUG FIX: HTML-escape all finding fields — evidence/descriptions contain
-            # attacker payloads (XSS, SQLi etc.) that would execute in the browser
             esc_title = _html.escape(f.title)
             esc_cat   = _html.escape(f.category)
             esc_sev   = _html.escape(f.severity)
@@ -2318,10 +2337,14 @@ class VulnScanner:
               </td>
             </tr>"""
 
+        # FIX: HTML-escape self.target to prevent XSS in the report file itself
+        esc_target   = _html.escape(self.target)
+        esc_waf_name = _html.escape(self.result.waf_name)
+
         html = f"""<!DOCTYPE html>
 <html lang="en"><head><meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>WebSentinel {__version__} — {self.target}</title>
+<title>WebSentinel {__version__} — {esc_target}</title>
 <style>
 :root{{--bg:#0f1117;--card:#1a1d27;--bdr:#2d3148;--txt:#e2e8f0;--dim:#64748b}}
 *{{box-sizing:border-box;margin:0;padding:0}}
@@ -2342,13 +2365,13 @@ td{{padding:.6rem 1rem;border-top:1px solid var(--bdr);font-size:.87rem;vertical
 code{{background:#0f1117;padding:.1rem .3rem;border-radius:4px;font-size:.79rem;word-break:break-all}}
 footer{{margin-top:2rem;color:var(--dim);font-size:.8rem;text-align:center}}
 </style></head><body>
-<h1>🛡 WebSentinel Security Report <small style="font-size:1rem;color:var(--dim)">v{__version__}</small></h1>
+<h1>&#x1F6E1; WebSentinel Security Report <small style="font-size:1rem;color:var(--dim)">v{__version__}</small></h1>
 <div class="meta">
-  Target: <strong>{self.target}</strong> &nbsp;|&nbsp;
-  {self.result.start_time} → {self.result.end_time} &nbsp;|&nbsp;
+  Target: <strong>{esc_target}</strong> &nbsp;|&nbsp;
+  {self.result.start_time} &rarr; {self.result.end_time} &nbsp;|&nbsp;
   Total: <strong>{sum(summary.values())}</strong> &nbsp;|&nbsp;
   Risk Score: <strong style="color:#f97316">{risk_score}</strong>
-  {f'&nbsp;|&nbsp; WAF: <strong style="color:#eab308">{self.result.waf_name}</strong>' if self.result.waf_detected else ''}
+  {f'&nbsp;|&nbsp; WAF: <strong style="color:#eab308">{esc_waf_name}</strong>' if self.result.waf_detected else ''}
 </div>
 <div class="cards">
   {''.join(f'<div class="card"><div class="n" style="color:{sev_colors[s]}">{summary[s]}</div><div class="l">{s}</div></div>' for s in ("CRITICAL","HIGH","MEDIUM","LOW","INFO"))}
@@ -2368,7 +2391,7 @@ footer{{margin-top:2rem;color:var(--dim);font-size:.8rem;text-align:center}}
         summary    = self.result.summary()
         risk_score = (summary["CRITICAL"]*10 + summary["HIGH"]*7 +
                       summary["MEDIUM"]*4  + summary["LOW"]*1)
-        md = f"""# 🛡 WebSentinel v{__version__} Security Report
+        md = f"""# &#x1F6E1; WebSentinel v{__version__} Security Report
 
 | Field | Value |
 |-------|-------|
