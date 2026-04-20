@@ -1,28 +1,171 @@
+# ================================
+
+# Python Core
+
+# ================================
+
 __pycache__/
 *.py[cod]
-*.pyo
-*.pyd
-.Python
-*.egg
-*.egg-info/
-dist/
-build/
+*$py.class
 *.so
 
-# Reports (don't commit scan results)
-*.json
-*.html
-report.*
+# ================================
 
-# Virtual env
+# Virtual Environments
+
+# ================================
+
 venv/
 .venv/
 env/
+ENV/
+env.bak/
+venv.bak/
 
-# IDE
-.idea/
-.vscode/
+# ================================
+
+# Distribution / Packaging
+
+# ================================
+
+.Python
+build/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# ================================
+
+# Testing / Coverage
+
+# ================================
+
+.pytest_cache/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+htmlcov/
+
+# ================================
+
+# Type Checkers / Linters
+
+# ================================
+
+.mypy_cache/
+.dmypy.json
+.pyre/
+.pytype/
+.ruff_cache/
+
+# ================================
+
+# Logs & Runtime Files
+
+# ================================
+
+*.log
+*.out
+*.err
+*.pid
+*.pid.lock
+
+# ================================
+
+# Security / Sensitive Data
+
+# ================================
+
+.env
+.env.*
+*.key
+*.pem
+*.crt
+*.p12
+*.pfx
+secrets.json
+tokens.json
+
+# ================================
+
+# Reports (Scoped, not global)
+
+# ================================
+
+report.*
+scan_results/
+outputs/
+reports/
+
+# ================================
+
+# Temporary Files
+
+# ================================
+
+*.tmp
+*.temp
 *.swp
 *.swo
+*~
+
+# ================================
+
+# IDE / Editor
+
+# ================================
+
+.idea/
+.vscode/
+*.code-workspace
+
+# ================================
+
+# OS Files
+
+# ================================
+
 .DS_Store
 Thumbs.db
+desktop.ini
+
+# ================================
+
+# Jupyter / Notebooks
+
+# ================================
+
+.ipynb_checkpoints/
+
+# ================================
+
+# CLI / Tool Specific
+
+# ================================
+
+*.har
+*.gnmap
+*.nmap
+*.xml
+
+# ================================
+
+# Misc
+
+# ================================
+
+*.bak
+*.old
+*.orig
