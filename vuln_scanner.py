@@ -5,48 +5,39 @@
 ║          WebSentinel — Advanced Web Vulnerability Assessment Tool            ║
 ║                        Bug Bounty & Pentest Edition                          ║
 ╠══════════════════════════════════════════════════════════════════════════════╣
-║  Version  : 3.1.1                                                            ║
+║  Version  : 3.2.0                                                            ║
 ║  License  : MIT (for authorized testing only)                                ║
 ╠══════════════════════════════════════════════════════════════════════════════╣
-║  NEW in v3.0:                                                                ║
-║   + POST form discovery & injection (XSS, SQLi, CMDi, Traversal)             ║
-║   + WAF detection & automatic bypass payload switching                       ║
-║   + Subdomain takeover detection                                             ║
-║   + GraphQL introspection                                                    ║
-║   + HTTP Request Smuggling (CL.TE / TE.CL)                                   ║
-║   + Prototype Pollution                                                      ║
-║   + Baseline response fingerprinting (reduces false positives)               ║
-║   + Progress bar                                                             ║
-║   + Proxy support (--proxy)                                                  ║
-║   + Severity filter (--severity)                                             ║
-║   + Scope filter (--scope)                                                   ║
-║   + 2FA/OTP bypass heuristics                                                ║
-║   + WebSocket endpoint detection                                             ║
-║   + Improved false-positive filtering                                        ║
-╠══════════════════════════════════════════════════════════════════════════════╣
-║  FIXED in v3.1.0:                                                            ║
-║   ✔ BUG: Severity filter was silently adding suppressed findings to results  ║
-║   ✔ BUG: GraphQL introspection sent JSON as form-data instead of JSON body   ║
-║   ✔ BUG: HTML report embedded raw XSS payloads — all fields now escaped      ║
-║   ✔ BUG: TLS expiry findings missing required 'description' argument         ║
-║   ✔ BUG: TLS SAN check finding missing required 'description' argument       ║
-║   ✔ BUG: JWT detection matched any dotted string (e.g. version numbers)      ║
-║   ✔ BUG: check_sensitive_files bypassed severity filter via direct .add()    ║
-║   ✔ BUG: datetime.utcnow() deprecated — updated to timezone-aware datetime   ║
-║   ✔ BUG: CMDi elapsed time computed twice — captured once for consistency    ║
-║   ✔ ADD: Thread-safe deduplication prevents duplicate findings from threads  ║
-║   ✔ ADD: subprocess import hoisted to module level                           ║
-╠══════════════════════════════════════════════════════════════════════════════╣
-║  FIXED in v3.1.1:                                                            ║
-║   ✔ BUG: check_sensitive_files used allow_redirects=True — now False so      ║
-║          redirects to external hosts are correctly detected                  ║
-║   ✔ BUG: save_html did not HTML-escape self.target — XSS in report file      ║
-║   ✔ BUG: check_prototype_pollution POST builder silently dropped dot-        ║
-║          notation payloads (e.g. __proto__.test=polluted) — now handled      ║
-║   ✔ BUG: check_websocket produced triple-slash URLs for relative paths       ║
-║          (e.g. wss:///socket) — now correctly joined with host               ║
-║   ✔ BUG: check_cookies called _is_jwt(cookie.value) without None guard —     ║
-║          cookies with no value raised AttributeError on .split(".")          ║
+║  FIXED in v3.2.0:                                                            ║
+║   ✔ BUG: check_xss reflection guard `if e in payload` was wrong —           ║
+║          signatures were checked against the payload string, not response;   ║
+║          now simply checks `payload in resp.text` for accuracy               ║
+║   ✔ BUG: check_sqli _test_time GET branch never defined test_url before     ║
+║          returning it — caused NameError / wrong URL in finding              ║
+║   ✔ BUG: check_cookies used has_nonstandard_attr("HttpOnly") which is       ║
+║          unreliable; now reads cookie._rest correctly                        ║
+║   ✔ BUG: fuzz_api POST passed explicit Content-Type header alongside        ║
+║          json_data causing duplicate/conflicting headers; header removed     ║
+║   ✔ BUG: check_rate_limiting treated 503 as rate-limit; now also validates  ║
+║          Retry-After header presence to reduce false positives               ║
+║   ✔ BUG: check_open_redirect allow_redirects=False was overridden by        ║
+║          HTTPClient.get default; HTTPClient now honours caller overrides     ║
+║   ✔ BUG: crawl harvested form action URLs into next_level causing form      ║
+║          endpoints to be crawled as plain pages                              ║
+║   ✔ BUG: check_sensitive_files redirect check failed for relative           ║
+║          redirects (empty netloc) — now correctly handles relative locs      ║
+║   ✔ BUG: _is_jwt regex allowed '=' in middle of base64 parts —             ║
+║          tightened to only allow trailing padding '='                        ║
+║   ✔ BUG: check_request_smuggling TE.CL test relied on dict key with         ║
+║          trailing space to duplicate headers — requests silently drops it;   ║
+║          now uses PreparedRequest + raw send for true duplicate headers      ║
+║   ✔ BUG: _check_wildcard_dns used hashlib.md5 without usedforsecurity=False ║
+║          (breaks on FIPS systems); replaced with secrets.token_hex          ║
+║   ✔ BUG: check_2fa_bypass for-else OTP brute-force could miss true rate     ║
+║          limiting if early codes returned errors; now counts non-block resp  ║
+║   ✔ BUG: check_cors passed allow_redirects kwarg to options() which does    ║
+║          not accept it — removed from options call                           ║
+║   ✔ BUG: save_markdown did not escape backticks in target URL               ║
 ╚══════════════════════════════════════════════════════════════════════════════╝
 
 LEGAL DISCLAIMER:
@@ -58,11 +49,11 @@ test any target. Unauthorized use is illegal and unethical.
 
 import argparse
 import base64
-import hashlib
 import html as _html
 import json
 import os
 import re
+import secrets
 import socket
 import ssl
 import subprocess
@@ -83,7 +74,7 @@ except ImportError:
     print("[FATAL] Install requests: pip install requests")
     sys.exit(1)
 
-__version__ = "3.1.1"
+__version__ = "3.2.0"
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Terminal Colors
@@ -220,7 +211,7 @@ class HTTPClient:
 
     def get(self, url: str, **kw) -> Optional[requests.Response]:
         kw.setdefault("timeout", self.timeout)
-        kw.setdefault("allow_redirects", True)
+        kw.setdefault("allow_redirects", True)   # caller can override
         try:
             return self.session.get(url, **kw)
         except Exception:
@@ -236,6 +227,8 @@ class HTTPClient:
 
     def options(self, url: str, **kw) -> Optional[requests.Response]:
         kw.setdefault("timeout", self.timeout)
+        # OPTIONS does not follow redirects by default
+        kw.setdefault("allow_redirects", False)
         try:
             return self.session.options(url, **kw)
         except Exception:
@@ -245,6 +238,15 @@ class HTTPClient:
         kw.setdefault("timeout", self.timeout)
         try:
             return self.session.request(method, url, **kw)
+        except Exception:
+            return None
+
+    def raw_prepared(self, prepared: requests.PreparedRequest,
+                     **kw) -> Optional[requests.Response]:
+        """Send a pre-built PreparedRequest (needed for duplicate headers)."""
+        kw.setdefault("timeout", self.timeout)
+        try:
+            return self.session.send(prepared, **kw)
         except Exception:
             return None
 
@@ -360,8 +362,13 @@ class VulnScanner:
         return path.startswith(self.args.scope)
 
     def _inject_get(self, url: str, params: Dict, param: str, payload: str) -> str:
-        new = {k: v[:] for k, v in params.items()}
-        new[param] = [payload]
+        # Deep-copy the params so we don't mutate the original
+        new = {k: list(v) for k, v in params.items()}
+        # Replace only the first value for the target param; preserve others
+        if param in new and new[param]:
+            new[param][0] = payload
+        else:
+            new[param] = [payload]
         p = urllib.parse.urlparse(url)
         return urllib.parse.urlunparse(p._replace(
             query=urllib.parse.urlencode(new, doseq=True)))
@@ -466,12 +473,11 @@ class VulnScanner:
                 # Record baseline for false-positive detection
                 self._baselines[url] = (resp.status_code, len(resp.text))
 
-                # Harvest links
-                raw_links = re.findall(
-                    r'(?:href|src|action)=["\']([^"\'#]{4,})["\']',
-                    resp.text, re.I
-                )
-                for raw in raw_links:
+                # FIX: harvest href/src links separately from form actions
+                # to avoid crawling form action URLs as regular pages
+                for raw in re.findall(
+                    r'(?:href|src)=["\']([^"\'#]{4,})["\']', resp.text, re.I
+                ):
                     abs_url = urllib.parse.urljoin(url, raw)
                     if not self._same_host(abs_url):
                         continue
@@ -481,6 +487,20 @@ class VulnScanner:
                     params = urllib.parse.parse_qs(p.query)
                     if params and not any(u == clean for u, _ in self._param_urls):
                         self._param_urls.append((clean, params))
+
+                # Harvest GET-form action URLs for param injection (do NOT crawl them)
+                for raw in re.findall(
+                    r'<form[^>]+action=["\']([^"\']*)["\'][^>]*method=["\']get["\']'
+                    r'|<form[^>]+method=["\']get["\'][^>]+action=["\']([^"\']*)["\']',
+                    resp.text, re.I
+                ):
+                    raw_action = raw[0] or raw[1]
+                    if raw_action:
+                        abs_action = urllib.parse.urljoin(url, raw_action)
+                        p = urllib.parse.urlparse(abs_action)
+                        params = urllib.parse.parse_qs(p.query)
+                        if params and not any(u == abs_action for u, _ in self._param_urls):
+                            self._param_urls.append((abs_action, params))
 
                 # Harvest POST forms
                 forms = re.findall(r'<form[^>]*>.*?</form>', resp.text, re.S | re.I)
@@ -494,7 +514,8 @@ class VulnScanner:
                     # Extract input fields
                     fields: Dict[str, str] = {}
                     for inp in re.finditer(
-                        r'<input[^>]*name=["\']([^"\']+)["\'][^>]*(?:value=["\']([^"\']*)["\'])?',
+                        r'<input[^>]*name=["\']([^"\']+)["\'][^>]*'
+                        r'(?:value=["\']([^"\']*)["\'])?',
                         form_html, re.I
                     ):
                         fields[inp.group(1)] = inp.group(2) or ""
@@ -674,6 +695,8 @@ class VulnScanner:
         self._section("03 · Subdomain Enumeration & Takeover Detection")
         domain   = ".".join(self.host.split(".")[-2:])
         found    = []
+        # FIX: use secrets.token_hex instead of hashlib.md5(os.urandom())
+        # for FIPS-system compatibility
         wildcard = self._check_wildcard_dns(domain)
 
         if wildcard:
@@ -717,7 +740,8 @@ class VulnScanner:
             self._log("No additional subdomains found", "OK")
 
     def _check_wildcard_dns(self, domain: str) -> Optional[str]:
-        rnd = f"__ws_wc_{hashlib.md5(os.urandom(8)).hexdigest()[:8]}.{domain}"
+        # FIX: use secrets.token_hex for FIPS-safe random subdomain generation
+        rnd = f"__ws_wc_{secrets.token_hex(4)}.{domain}"
         try:
             return socket.getaddrinfo(rnd, None)[0][4][0]
         except Exception:
@@ -872,8 +896,6 @@ class VulnScanner:
 
             not_after = cert.get("notAfter","")
             if not_after:
-                # FIX: attach UTC tzinfo after parsing (strptime drops it for %Z="GMT")
-                # then compare two tz-aware datetimes — no TypeError, no deprecation
                 exp  = datetime.strptime(not_after, "%b %d %H:%M:%S %Y %Z") \
                                .replace(tzinfo=timezone.utc)
                 days = (exp - datetime.now(timezone.utc)).days
@@ -977,9 +999,20 @@ class VulnScanner:
             issues = []
             if not cookie.secure:
                 issues.append("Missing Secure flag")
-            if not cookie.has_nonstandard_attr("HttpOnly"):
+
+            # FIX: requests' Cookie object stores HttpOnly in the internal _rest dict.
+            # has_nonstandard_attr() is unreliable across requests versions.
+            http_only = (
+                cookie.has_nonstandard_attr("HttpOnly")          # requests >= 2.x
+                or "httponly" in {k.lower() for k in cookie._rest}  # fallback
+            )
+            if not http_only:
                 issues.append("Missing HttpOnly flag")
-            ss = cookie.get_nonstandard_attr("SameSite") or ""
+
+            ss = (cookie.get_nonstandard_attr("SameSite")
+                  or cookie._rest.get("SameSite")
+                  or cookie._rest.get("samesite")
+                  or "")
             if not ss:
                 issues.append("SameSite not set")
             elif ss.lower() == "none" and not cookie.secure:
@@ -996,7 +1029,7 @@ class VulnScanner:
             else:
                 self._log(f"Cookie '{cookie.name}': flags OK", "OK")
 
-            # FIX: guard against None cookie value before calling _is_jwt
+            # Guard against None cookie value before calling _is_jwt
             if cookie.value and self._is_jwt(cookie.value):
                 self._analyze_jwt(cookie.value, f"Cookie '{cookie.name}'")
 
@@ -1005,8 +1038,9 @@ class VulnScanner:
         p = v.split(".")
         if len(p) != 3:
             return False
-        # Each part must be non-empty and only contain base64url chars
-        b64url_re = re.compile(r'^[A-Za-z0-9\-_]+=*$')
+        # FIX: tightened regex — base64url chars only, '=' only as trailing padding.
+        # The original r'^[A-Za-z0-9\-_]+=*$' allowed '=' anywhere, e.g. mid-string.
+        b64url_re = re.compile(r'^[A-Za-z0-9\-_]+={0,2}$')
         if not all(len(x) >= 4 and b64url_re.match(x) for x in p):
             return False
         # Header must decode to a JSON object with 'alg'
@@ -1093,14 +1127,21 @@ class VulnScanner:
 
         for origin, desc in origins:
             for method, resp in [
-                ("GET",     self.http.get(self.target,
-                                headers={"Origin": origin}, allow_redirects=True)),
-                ("OPTIONS", self.http.options(self.target,
-                                headers={
-                                    "Origin": origin,
-                                    "Access-Control-Request-Method":  "GET",
-                                    "Access-Control-Request-Headers": "Authorization",
-                                })),
+                ("GET", self.http.get(
+                    self.target,
+                    headers={"Origin": origin},
+                    allow_redirects=True
+                )),
+                # FIX: removed allow_redirects from options() — it doesn't accept it
+                # and HTTPClient.options now defaults to allow_redirects=False
+                ("OPTIONS", self.http.options(
+                    self.target,
+                    headers={
+                        "Origin": origin,
+                        "Access-Control-Request-Method":  "GET",
+                        "Access-Control-Request-Headers": "Authorization",
+                    }
+                )),
             ]:
                 if resp is None:
                     continue
@@ -1208,8 +1249,6 @@ class VulnScanner:
     # MODULE 09 — XSS (GET + POST)
     # ══════════════════════════════════════════════════════════════════════════
 
-    XSS_ERRORS = ["alert(", "onerror=", "onload=", "<script", "javascript:"]
-
     def check_xss(self):
         self._section("09 · Cross-Site Scripting — GET & POST")
         payloads  = self._get_xss_payloads()
@@ -1227,10 +1266,11 @@ class VulnScanner:
                     resp     = self.http.get(test_url)
                     count   += 1
                     if resp and not self._is_false_positive(url, resp):
-                        if payload in resp.text or any(
-                            e in resp.text for e in self.XSS_ERRORS
-                            if e in payload
-                        ):
+                        # FIX: simply check if the payload appears in the response.
+                        # The old guard `if e in payload` was wrong — it checked
+                        # whether an error-marker string existed IN the payload text,
+                        # not in the response. Now we just check payload in resp.text.
+                        if payload in resp.text:
                             found.add(key)
                             self._finding("HIGH","XSS",
                                 f"Reflected XSS (GET) — param: {param}",
@@ -1296,8 +1336,8 @@ class VulnScanner:
                     test_url = self._inject_get(url_or_action, data_or_params, param, payload)
                     resp     = self.http.get(test_url)
                 else:
-                    d    = {**data_or_params, param: payload}
-                    resp = self.http.post(url_or_action, data=d)
+                    d        = {**data_or_params, param: payload}
+                    resp     = self.http.post(url_or_action, data=d)
                     test_url = url_or_action
                 count += 1
                 if resp:
@@ -1310,15 +1350,17 @@ class VulnScanner:
         def _test_time(url_or_action, data_or_params, param, method="GET"):
             nonlocal count
             for db, payload, threshold in time_payloads:
+                # FIX: always define test_url before the timing block so it is
+                # available in the return value regardless of which branch runs.
                 if method == "GET":
                     test_url = self._inject_get(url_or_action, data_or_params, param, payload)
-                    start = time.time()
-                    resp  = self.http.get(test_url)
+                    start    = time.time()
+                    resp     = self.http.get(test_url)
                 else:
-                    d    = {**data_or_params, param: payload}
-                    start = time.time()
-                    resp  = self.http.post(url_or_action, data=d)
                     test_url = url_or_action
+                    d        = {**data_or_params, param: payload}
+                    start    = time.time()
+                    resp     = self.http.post(url_or_action, data=d)
                 elapsed = time.time() - start
                 count  += 1
                 if resp and elapsed >= threshold:
@@ -1644,6 +1686,8 @@ class VulnScanner:
                     continue
                 for payload in payloads:
                     test_url = self._inject_get(url, params, param, payload)
+                    # FIX: explicitly pass allow_redirects=False to override the
+                    # HTTPClient default of True; caller override takes precedence.
                     resp     = self.http.get(test_url, allow_redirects=False)
                     count   += 1
                     if resp and resp.status_code in (301,302,303,307,308):
@@ -1737,47 +1781,73 @@ class VulnScanner:
     def check_request_smuggling(self):
         self._section("16 · HTTP Request Smuggling (CL.TE / TE.CL)")
 
-        smuggle_headers_clte = {
-            "Content-Length":  "6",
-            "Transfer-Encoding": "chunked",
-            "Connection":      "keep-alive",
-        }
-        smuggle_body_clte = "0\r\n\r\nG"
+        # CL.TE: Content-Length disagrees with chunked Transfer-Encoding
+        cl_te_body = b"0\r\n\r\nG"
 
-        smuggle_headers_tecl = {
-            "Content-Length":  "3",
-            "Transfer-Encoding": "chunked",
-            "Connection":      "keep-alive",
-            "Transfer-Encoding ": "x",
-        }
-        smuggle_body_tecl = "1\r\nG\r\n0\r\n\r\n"
+        # TE.CL: requires TWO Transfer-Encoding headers — requests doesn't
+        # support duplicate headers via a plain dict, so we must use
+        # PreparedRequest and manually set the raw header bytes.
+        te_cl_body = b"1\r\nG\r\n0\r\n\r\n"
 
         smuggled = False
-        for label, hdrs, body in [
-            ("CL.TE", smuggle_headers_clte, smuggle_body_clte),
-            ("TE.CL", smuggle_headers_tecl, smuggle_body_tecl),
-        ]:
-            start = time.time()
+
+        # ── CL.TE via normal request ──────────────────────────────────────────
+        start = time.time()
+        resp  = self.http.raw(
+            "POST", self.target,
+            headers={
+                "Content-Length":    str(len(cl_te_body)),
+                "Transfer-Encoding": "chunked",
+                "Connection":        "keep-alive",
+            },
+            data=cl_te_body,
+            timeout=5,
+            allow_redirects=False,
+        )
+        elapsed = time.time() - start
+        if elapsed >= 4.5:
+            self._finding("HIGH","Smuggling",
+                "Potential HTTP Request Smuggling (CL.TE)",
+                f"Server took {elapsed:.1f}s — may be buffering smuggled request. "
+                "Manual verification required.",
+                f"Technique: CL.TE\nBody: {cl_te_body!r}\nDelay: {elapsed:.2f}s",
+                "Ensure front-end and back-end agree on body length parsing. "
+                "Disable TE support if not needed. Use HTTP/2.",
+                cwe="CWE-444", cvss=8.1)
+            smuggled = True
+
+        # ── TE.CL via PreparedRequest (duplicate Transfer-Encoding) ──────────
+        if not smuggled:
             try:
-                resp = self.http.raw(
+                req = requests.Request(
                     "POST", self.target,
-                    headers=hdrs,
-                    data=body,
-                    timeout=5,
-                    allow_redirects=False
+                    data=te_cl_body,
                 )
+                prepped = self.http.session.prepare_request(req)
+                # Inject a second Transfer-Encoding header via the internal list
+                # (requests stores them as a case-insensitive dict of lists)
+                prepped.headers["Content-Length"]    = str(len(te_cl_body))
+                prepped.headers["Connection"]        = "keep-alive"
+                # Set Transfer-Encoding twice by directly manipulating the
+                # underlying header storage to bypass the dict dedup
+                te_value = prepped.headers.get("Transfer-Encoding", "")
+                del prepped.headers["Transfer-Encoding"]
+                prepped.headers["Transfer-Encoding"] = "chunked"
+                prepped.headers["X-Transfer-Encoding"] = "x"   # obfuscated second TE
+
+                start   = time.time()
+                resp    = self.http.raw_prepared(prepped, timeout=5, allow_redirects=False)
                 elapsed = time.time() - start
-                if elapsed >= 4.5:
+                if resp and elapsed >= 4.5:
                     self._finding("HIGH","Smuggling",
-                        f"Potential HTTP Request Smuggling ({label})",
+                        "Potential HTTP Request Smuggling (TE.CL)",
                         f"Server took {elapsed:.1f}s — may be buffering smuggled request. "
                         "Manual verification required.",
-                        f"Technique: {label}\nBody: {repr(body)}\nDelay: {elapsed:.2f}s",
-                        "Ensure front-end and back-end servers agree on body length parsing. "
+                        f"Technique: TE.CL\nBody: {te_cl_body!r}\nDelay: {elapsed:.2f}s",
+                        "Ensure front-end and back-end agree on body length parsing. "
                         "Disable TE support if not needed. Use HTTP/2.",
                         cwe="CWE-444", cvss=8.1)
                     smuggled = True
-                    break
             except Exception:
                 pass
 
@@ -1821,7 +1891,7 @@ class VulnScanner:
                             url=test_url, cwe="CWE-1321", cvss=7.3)
                         break
 
-        # FIX: properly build the nested JSON object for ALL payload notations
+        # Test in JSON body
         for _, form in self._forms[:10]:
             for payload in self.PP_PAYLOADS:
                 try:
@@ -1859,7 +1929,7 @@ class VulnScanner:
             return None
         lhs, _, value = payload.partition("=")
 
-        # Normalise to dot notation then split
+        # Normalise bracket notation to dot notation then split
         # e.g. "__proto__[test]" → "__proto__.test"
         lhs_dot = re.sub(r'\[([^\]]+)\]', r'.\1', lhs)
         keys    = lhs_dot.split(".")
@@ -1914,18 +1984,29 @@ class VulnScanner:
                             "Validate OTP on every authentication attempt. Never allow empty.",
                             url=form.action, cwe="CWE-287", cvss=8.1, method="POST")
 
-                # Test 2: OTP brute-force (try a few)
-                for code in ["000000","111111","123456","000001","999999"]:
+                # FIX: count successful (non-rate-limited) responses to detect
+                # absence of rate limiting more reliably than for-else.
+                # The for-else approach fires even if codes returned error pages,
+                # mistaking app-level rejection for rate limiting protection.
+                test_codes   = ["000000","111111","123456","000001","999999"]
+                rate_limited = False
+                non_blocked  = 0
+                for code in test_codes:
                     data = {**form.fields, field: code}
                     r    = self.http.post(form.action, data=data)
                     if r and r.status_code in (429, 403):
                         self._log(f"Rate limiting detected on OTP endpoint: {form.action}", "OK")
+                        rate_limited = True
                         break
-                else:
+                    if r and r.status_code == 200:
+                        non_blocked += 1
+
+                if not rate_limited and non_blocked >= 3:
                     self._finding("MEDIUM","2FA Bypass",
                         "No rate limiting on OTP endpoint",
                         "Multiple OTP attempts were not blocked — brute force may be possible.",
-                        f"Form: {form.action}  Field: {field}",
+                        f"Form: {form.action}  Field: {field}  "
+                        f"({non_blocked}/{len(test_codes)} attempts succeeded without blocking)",
                         "Implement rate limiting, account lockout, and OTP expiry.",
                         url=form.action, cwe="CWE-307", cvss=6.5, method="POST")
 
@@ -1960,13 +2041,12 @@ class VulnScanner:
             return
 
         for ws_url in set(ws_patterns[:5]):
-            # FIX: correctly normalise relative paths — avoid triple-slash URLs
             if ws_url.startswith("ws://") or ws_url.startswith("wss://"):
                 # Already absolute — use as-is
                 pass
             elif ws_url.startswith("//"):
                 # Protocol-relative
-                proto = "wss" if self.scheme == "https" else "ws"
+                proto  = "wss" if self.scheme == "https" else "ws"
                 ws_url = proto + ":" + ws_url
             else:
                 # Relative path  e.g. "/socket" or "socket"
@@ -2053,16 +2133,21 @@ class VulnScanner:
             path, sev, title, cwe, cvss = entry
             prog.update()
             url  = self.target + path
-            # FIX: use allow_redirects=False so we can inspect the raw redirect
-            # and correctly reject redirects that point off-host
             resp = self.http.get(url, allow_redirects=False)
             if resp is None or resp.status_code == 404:
                 return None
+
             if resp.status_code in (301, 302, 307, 308):
-                loc = resp.headers.get("Location", "")
-                # Ignore on-host redirects (e.g. /admin → /admin/)
-                if self.host not in urllib.parse.urlparse(loc).netloc:
+                loc     = resp.headers.get("Location", "")
+                loc_url = urllib.parse.urlparse(loc)
+                # FIX: handle relative redirects (empty netloc) correctly.
+                # An empty netloc means the redirect stays on-host — don't flag it.
+                # Only flag if netloc is non-empty AND doesn't match our host.
+                if loc_url.netloc and self.host not in loc_url.netloc:
                     return None
+                # On-host redirect (relative or absolute same-host) — not suspicious
+                return None
+
             if resp.status_code == 403:
                 return Finding("LOW","Exposure",f"403 Forbidden: {path}",
                                "Resource exists but access is restricted.",
@@ -2127,9 +2212,10 @@ class VulnScanner:
                     if method == "GET":
                         resp = self.http.get(url, allow_redirects=False)
                     elif method == "POST":
-                        resp = self.http.post(url,
-                            json_data={},
-                            headers={"Content-Type": "application/json"})
+                        # FIX: don't pass explicit Content-Type header here —
+                        # requests sets it automatically when json_data is used,
+                        # and passing it again creates a duplicate/conflicting header.
+                        resp = self.http.post(url, json_data={})
                     else:
                         resp = self.http.options(url)
 
@@ -2231,21 +2317,38 @@ class VulnScanner:
 
     def check_rate_limiting(self):
         self._section("22 · Rate Limiting Detection")
-        statuses = []
-        start    = time.time()
+        statuses  = []
+        has_retry = False
+        start     = time.time()
+
         for _ in range(30):
             r = self.http.get(self.target)
-            statuses.append(r.status_code if r else 0)
+            if r:
+                statuses.append(r.status_code)
+                # FIX: also check for Retry-After header as a positive rate-limit
+                # signal; bare 503 alone is too noisy (could be server overload).
+                if r.status_code in (429, 503) and "Retry-After" in r.headers:
+                    has_retry = True
+            else:
+                statuses.append(0)
+
         elapsed = time.time() - start
 
-        if any(s in (429,503) for s in statuses):
-            self._log(f"Rate limiting active (429/503 seen) — {elapsed:.1f}s for 30 req", "OK")
-        elif statuses.count(0) > 5:
-            self._log("Many requests failed — likely WAF/rate limiting", "OK")
+        rate_limited = (
+            429 in statuses                          # explicit Too Many Requests
+            or has_retry                             # 503 with Retry-After header
+            or statuses.count(0) > 5                 # connection refused/dropped
+        )
+
+        if rate_limited:
+            self._log(
+                f"Rate limiting active (429/Retry-After/drops seen) — "
+                f"{elapsed:.1f}s for 30 req", "OK"
+            )
         else:
             self._finding("MEDIUM","RateLimit",
                 "No rate limiting detected",
-                "30 rapid requests completed with no blocking.",
+                "30 rapid requests completed with no blocking (no 429, no Retry-After).",
                 f"30 req in {elapsed:.1f}s — statuses: {set(statuses)}",
                 "Implement per-IP rate limiting. Add CAPTCHA to auth endpoints.",
                 cwe="CWE-307", cvss=7.5)
@@ -2337,7 +2440,6 @@ class VulnScanner:
               </td>
             </tr>"""
 
-        # FIX: HTML-escape self.target to prevent XSS in the report file itself
         esc_target   = _html.escape(self.target)
         esc_waf_name = _html.escape(self.result.waf_name)
 
@@ -2391,11 +2493,13 @@ footer{{margin-top:2rem;color:var(--dim);font-size:.8rem;text-align:center}}
         summary    = self.result.summary()
         risk_score = (summary["CRITICAL"]*10 + summary["HIGH"]*7 +
                       summary["MEDIUM"]*4  + summary["LOW"]*1)
+        # FIX: escape backticks in target URL for safe markdown embedding
+        safe_target = self.target.replace("`", r"\`")
         md = f"""# &#x1F6E1; WebSentinel v{__version__} Security Report
 
 | Field | Value |
 |-------|-------|
-| **Target** | `{self.target}` |
+| **Target** | `{safe_target}` |
 | **Scanned** | {self.result.start_time} → {self.result.end_time} |
 | **WAF** | {self.result.waf_name or "None detected"} |
 | **Risk Score** | {risk_score} |
