@@ -5,7 +5,7 @@
 [![License](https://img.shields.io/badge/License-MIT-green)](LICENSE)
 [![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey)]()
 [![Bug Bounty](https://img.shields.io/badge/Use%20Case-Bug%20Bounty%20%7C%20Pentest-red)]()
-[![Tests](https://img.shields.io/badge/Tests-92%20passing-brightgreen)]()
+[![Tests](https://img.shields.io/badge/Tests-119%20passing-brightgreen)]()
 
 > **For authorized security testing only. Unauthorized use is illegal.**
 
