@@ -992,7 +992,10 @@ class TestGraphQLIntrospection(unittest.TestCase):
             }
         }
 
-        s.http.post.side_effect = [probe_resp, intro_resp]
+        # The scanner probes 6 GraphQL endpoints; only /graphql hits — pad the
+        # remaining 5 endpoint probes (each needs a probe call) with None so
+        # the mock iterator doesn't run out before check_graphql() returns.
+        s.http.post.side_effect = [probe_resp, intro_resp] + [None] * 10
         s.check_graphql()
 
         # Collect all calls to http.post
@@ -1024,7 +1027,10 @@ class TestGraphQLIntrospection(unittest.TestCase):
         # Probe succeeds but introspection is blocked
         probe_resp = _mock_response(status=200, text='{"data": {"__typename": "Query"}}')
         blocked    = _mock_response(status=200, text='{"errors": [{"message": "introspection disabled"}]}')
-        s.http.post.side_effect = [probe_resp, blocked]
+        # The scanner probes 6 GraphQL endpoints; /graphql hits (probe_resp),
+        # then the introspection call is blocked. Pad remaining endpoint probes
+        # with None so the mock iterator doesn't exhaust prematurely.
+        s.http.post.side_effect = [probe_resp, blocked] + [None] * 10
         s.check_graphql()
         graphql = [f for f in s.result.findings if f.category == "GraphQL"]
         assert any(f.severity == "INFO" for f in graphql)
