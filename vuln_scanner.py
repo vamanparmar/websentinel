@@ -9,7 +9,7 @@
 ║  License  : MIT (for authorized testing only)                                ║
 ╠══════════════════════════════════════════════════════════════════════════════╣
 ║  FIXED in v3.2.0:                                                            ║
-║   ✔ BUG: check_xss reflection guard `if e in payload` was wrong —           ║
+║   ✔ BUG: check_xss reflection guard `if e in payload` was wrong —            ║
 ║          signatures were checked against the payload string, not response;   ║
 ║          now simply checks `payload in resp.text` for accuracy               ║
 ║   ✔ BUG: check_sqli _test_time GET branch never defined test_url before     ║
